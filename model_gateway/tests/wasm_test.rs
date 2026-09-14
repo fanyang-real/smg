@@ -192,6 +192,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
     let app_state = Arc::new(AppState {
         router,
         probe_state: ProbeState::new(app_context.inflight_tracker.clone()),
+        routing: None,
         context: app_context.clone(),
         admission_queue: None,
         gateway: None,

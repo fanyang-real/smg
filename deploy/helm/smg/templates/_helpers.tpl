@@ -150,18 +150,24 @@ Called from the router Deployment template.
 - {{ .Values.router.serviceDiscovery.modelIdFrom | quote }}
 {{- end }}
 {{- end }}
-{{- if .Values.router.multicluster.enabled }}
+{{- if eq .Values.router.multicluster.mode "push" }}
+- "--routing-api"
+- "--routing-reconcile-interval-secs"
+- {{ .Values.router.multicluster.reconcileIntervalSecs | quote }}
+{{- else if eq .Values.router.multicluster.mode "watch" }}
 - "--multicluster-routing"
-{{- if .Values.router.multicluster.selector }}
+{{- if .Values.router.multicluster.watch.selector }}
 - "--trafficmap-selector"
-- {{ .Values.router.multicluster.selector | quote }}
+- {{ .Values.router.multicluster.watch.selector | quote }}
 {{- end }}
-{{- if not .Values.router.multicluster.clusterWide }}
+{{- if not .Values.router.multicluster.watch.clusterWide }}
 - "--trafficmap-namespace"
-- {{ .Values.router.multicluster.namespace | default .Release.Namespace | quote }}
+- {{ .Values.router.multicluster.watch.namespace | default .Release.Namespace | quote }}
 {{- end }}
 - "--trafficmap-reconcile-interval-secs"
 - {{ .Values.router.multicluster.reconcileIntervalSecs | quote }}
+{{- else if ne .Values.router.multicluster.mode "off" }}
+{{- fail (printf "router.multicluster.mode must be one of off, push, watch; got %q" .Values.router.multicluster.mode) }}
 {{- end }}
 {{- if .Values.router.model }}
 - "--model-path"

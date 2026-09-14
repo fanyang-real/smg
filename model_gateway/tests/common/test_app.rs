@@ -102,6 +102,7 @@ pub fn create_test_app(
     let app_state = Arc::new(AppState {
         router,
         probe_state: start_probe_state(&app_context),
+        routing: None,
         context: app_context,
         admission_queue: None,
         gateway: None,
@@ -167,6 +168,7 @@ pub fn create_test_app_with_context(
     let app_state = Arc::new(AppState {
         router,
         probe_state: start_probe_state(&app_context),
+        routing: None,
         context: app_context.clone(),
         admission_queue: None,
         gateway: None,

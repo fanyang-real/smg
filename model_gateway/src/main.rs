@@ -631,9 +631,22 @@ struct CliArgs {
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_namespace: Option<String>,
 
-    /// Route across clusters from control-plane-published TrafficMap routing
-    /// tables. Off by default: with it off the gateway behaves exactly as
-    /// before and never reads a routing table.
+    /// Accept a cross-cluster routing table pushed by a control plane, over the
+    /// control-plane-authenticated API at /v1/routing. This is the intended way
+    /// to run multi-cluster routing.
+    #[arg(long, default_value_t = false, help_heading = "Multi-Cluster Routing")]
+    routing_api: bool,
+
+    /// How often to re-apply the pushed routing table even with nothing new
+    /// pushed, so a change that raced an in-flight registration, or a failed
+    /// registry job, cannot leave a backend holding the wrong share.
+    #[arg(long, default_value_t = 30, help_heading = "Multi-Cluster Routing")]
+    routing_reconcile_interval_secs: u64,
+
+    /// Watch the cluster for TrafficMap routing tables instead of being pushed
+    /// one. Needs no control-plane integration, so it suits a single replica or
+    /// a development cluster, but every replica then holds API credentials and
+    /// watches the API server. Mutually exclusive with --routing-api.
     #[arg(long, default_value_t = false, help_heading = "Multi-Cluster Routing")]
     multicluster_routing: bool,
 
@@ -2079,6 +2092,16 @@ impl CliArgs {
         // ==================== Mesh Server ====================
         let mesh_server_config = self.build_mesh_server_config()?;
 
+        // Both sources state the complete backend set on every pass, so
+        // together they would delete each other's backends on alternate
+        // reconciles. Refuse at startup rather than let that ship.
+        if self.routing_api && self.multicluster_routing {
+            return Err(ConfigError::InvalidValue {
+                field: "routing_api".to_string(),
+                value: "true".to_string(),
+                reason: smg::multicluster::BOTH_SOURCES_ERROR.to_string(),
+            });
+        }
         let multicluster_config = self.multicluster_routing.then(|| MultiClusterConfig {
             enabled: true,
             namespace: self.trafficmap_namespace.clone(),
@@ -2099,6 +2122,8 @@ impl CliArgs {
             log_json: self.log_json,
             service_discovery_config,
             multicluster_config,
+            routing_api_enabled: self.routing_api,
+            routing_reconcile_interval_secs: self.routing_reconcile_interval_secs,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {

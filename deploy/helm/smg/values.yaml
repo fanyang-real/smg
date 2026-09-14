@@ -46,18 +46,32 @@ router:
     # -- Extract model ID from pod metadata
     modelIdFrom: ""        # "namespace", "label:key", or "annotation:key"
 
-  # -- Route across clusters from control-plane-published TrafficMap routing
-  # tables. Each entry in a table becomes one backend: a whole remote cluster
-  # reached through its ingress, weighted by the share the control plane
-  # assigned it. Independent of serviceDiscovery above; enable either, both, or
-  # neither. Requires read on trafficmaps.ome.io, which the chart grants only
-  # when this is enabled.
+  # -- Route across clusters from a control-plane-computed traffic split. Each
+  # backend in the routing table is a whole remote cluster reached through its
+  # ingress, weighted by the share the control plane assigned it. Independent
+  # of serviceDiscovery above; use either, both, or neither.
   multicluster:
-    enabled: false
-    clusterWide: false     # set true to watch all namespaces (requires ClusterRole/ClusterRoleBinding)
-    namespace: ""          # defaults to release namespace
-    selector: ""           # e.g. "routing.tier=global"; empty obeys every table in scope
+    # -- How the routing table arrives. One of:
+    #   off    no cross-cluster routing (default)
+    #   push   a control plane programs /v1/routing. The intended mode: no API
+    #          credentials in serving pods, no API server on the serving path,
+    #          and the publisher knows what it programmed. The publisher must
+    #          reach every replica and re-state the table on a timer.
+    #   watch  this gateway watches trafficmaps.ome.io itself. Needs no
+    #          publisher, so it suits one replica or a dev cluster, but every
+    #          replica then holds API credentials and watches the API server.
+    # The two are mutually exclusive: each states the complete backend set on
+    # every pass, so together they would delete each other's backends.
+    mode: "off"
+    # -- How often to re-apply the table with nothing new arriving, so a change
+    # that raced an in-flight registration cannot leave a backend on the wrong
+    # share. Applies to both modes.
     reconcileIntervalSecs: 30
+    # -- watch mode only.
+    watch:
+      clusterWide: false   # set true to watch all namespaces (requires ClusterRole/ClusterRoleBinding)
+      namespace: ""        # defaults to release namespace
+      selector: ""         # e.g. "routing.tier=global"; empty obeys every table in scope
 
   # -- Model / tokenizer
   model: ""                # HuggingFace model ID or local path

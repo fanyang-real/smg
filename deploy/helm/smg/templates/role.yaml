@@ -1,6 +1,7 @@
-{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.mesh.enabled .Values.router.multicluster.enabled }}
+{{- $watching := eq .Values.router.multicluster.mode "watch" -}}
+{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.mesh.enabled $watching }}
 apiVersion: rbac.authorization.k8s.io/v1
-{{- if or .Values.router.serviceDiscovery.clusterWide .Values.router.multicluster.clusterWide }}
+{{- if or .Values.router.serviceDiscovery.clusterWide (and $watching .Values.router.multicluster.watch.clusterWide) }}
 kind: ClusterRole
 {{- else }}
 kind: Role
@@ -13,9 +14,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-{{- if .Values.router.multicluster.enabled }}
-  # Read-only, and granted only when multi-cluster routing is on: the routing
-  # tables are written by the control plane and the gateway never edits them.
+{{- if $watching }}
+  # Granted only in watch mode, and read-only. In push mode the gateway is
+  # programmed by a control plane and needs no access to the routing tables at
+  # all, which is most of the point of pushing.
   - apiGroups: ["ome.io"]
     resources: ["trafficmaps"]
     verbs: ["get", "list", "watch"]

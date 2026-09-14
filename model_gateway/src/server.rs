@@ -50,7 +50,7 @@ use crate::{
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     middleware::{self, AdmissionQueue, AuthConfig},
-    multicluster::{start_multicluster_discovery, MultiClusterConfig},
+    multicluster::{start_multicluster_discovery, MultiClusterConfig, RoutingState},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -85,6 +85,10 @@ pub struct AppState {
     /// probe listener. Maintained event-driven by
     /// [`crate::health::spawn_readiness_maintainer`].
     pub probe_state: Arc<crate::health::ProbeState>,
+    /// The pushed cross-cluster routing table; `None` unless `--routing-api`
+    /// is set, in which case nothing under `/v1/routing` exists and the
+    /// fallback 404s.
+    pub routing: Option<Arc<RoutingState>>,
 }
 
 async fn parse_function_call(
@@ -738,9 +742,15 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     pub log_json: bool,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
-    /// Consume control-plane-published routing tables and hold one backend per
-    /// remote serving cluster. `None` leaves multi-cluster routing off.
+    /// Watch the cluster for routing tables instead of being pushed one.
+    /// `None` leaves the watcher off.
     pub multicluster_config: Option<MultiClusterConfig>,
+    /// Serve `/v1/routing`, so a control plane can push the cross-cluster
+    /// routing table. Mutually exclusive with `multicluster_config`.
+    pub routing_api_enabled: bool,
+    /// How often to re-apply the pushed routing table even with nothing new
+    /// pushed, so a change that raced an in-flight registration is not lost.
+    pub routing_reconcile_interval_secs: u64,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
@@ -1011,6 +1021,17 @@ pub fn build_app(
         apply_control_plane_auth(Router::new().nest("/v1/rl", smg_rl::router(Arc::clone(rl))))
     });
 
+    // Cross-cluster routing: mounted only when a control plane is meant to
+    // program this gateway, so with `--routing-api` off nothing under
+    // `/v1/routing` exists and the sink 404s. Programming the data plane is as
+    // privileged as adding a worker, so it goes behind the same auth.
+    let routing_routes = app_state.routing.as_ref().map(|routing| {
+        apply_control_plane_auth(Router::new().nest(
+            "/v1/routing",
+            crate::multicluster::api::router(Arc::clone(routing)),
+        ))
+    });
+
     // `/ha/*` management routes (routers/mesh handlers) are removed
     // in this PR — they all read/write through the v1
     // `MeshSyncManager` and don't map cleanly onto the v2 adapters.
@@ -1026,6 +1047,9 @@ pub fn build_app(
         .merge(worker_routes);
     if let Some(rl_routes) = rl_routes {
         app = app.merge(rl_routes);
+    }
+    if let Some(routing_routes) = routing_routes {
+        app = app.merge(routing_routes);
     }
 
     Ok(app
@@ -1380,6 +1404,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
     }
 
+    let routing = config.routing_api_enabled.then(|| {
+        let state = Arc::new(RoutingState::new(
+            Arc::clone(&app_context),
+            Duration::from_secs(config.routing_reconcile_interval_secs),
+        ));
+        state.spawn_reconciler();
+        info!(
+            "Cross-cluster routing API listening on /v1/routing; \
+             the table is empty until a control plane pushes one"
+        );
+        state
+    });
+
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
@@ -1388,6 +1425,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_handler,
         mesh_adapters,
         probe_state,
+        routing,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
@@ -1669,6 +1707,8 @@ mod tests {
             log_json: false,
             service_discovery_config: None,
             multicluster_config: None,
+            routing_api_enabled: false,
+            routing_reconcile_interval_secs: 30,
             prometheus_config: None,
             request_timeout_secs: 60,
             request_id_headers: None,

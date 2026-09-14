@@ -48,7 +48,7 @@ pub struct Projection {
 ///
 /// Trailing slashes and surrounding whitespace are cosmetic in a URL but not in
 /// a map key, so two spellings of one home would otherwise open two backends.
-fn normalize_endpoint(raw: &str) -> Option<String> {
+pub(crate) fn normalize_endpoint(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return None;

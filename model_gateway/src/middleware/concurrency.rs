@@ -290,6 +290,7 @@ mod tests {
         Arc::new(AppState {
             router: Arc::new(Gateway::new(context.worker_registry.clone())),
             probe_state: ProbeState::new(context.inflight_tracker.clone()),
+            routing: None,
             context,
             admission_queue,
             gateway: None,

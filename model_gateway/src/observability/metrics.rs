@@ -188,6 +188,18 @@ pub(crate) fn init_metrics() {
         "smg_admission_inflight",
         "Requests currently holding an admission token"
     );
+    describe_gauge!(
+        "smg_routing_table_generation",
+        "Version of the cross-cluster routing table currently applied"
+    );
+    describe_gauge!(
+        "smg_routing_table_services",
+        "Services in the applied cross-cluster routing table"
+    );
+    describe_gauge!(
+        "smg_routing_table_age_seconds",
+        "Seconds since the cross-cluster routing table last changed"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(
@@ -1451,6 +1463,24 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
+    }
+
+    /// Version of the cross-cluster routing table currently applied.
+    pub fn set_routing_table_generation(generation: u64) {
+        gauge!("smg_routing_table_generation").set(generation as f64);
+    }
+
+    /// Services in the applied cross-cluster routing table.
+    pub fn set_routing_table_services(count: usize) {
+        gauge!("smg_routing_table_services").set(count as f64);
+    }
+
+    /// Seconds since the cross-cluster routing table last changed.
+    ///
+    /// The one number that distinguishes a control plane with nothing to say
+    /// from a control plane that has stopped saying anything.
+    pub fn set_routing_table_age_seconds(age: u64) {
+        gauge!("smg_routing_table_age_seconds").set(age as f64);
     }
 
     // ========================================================================
