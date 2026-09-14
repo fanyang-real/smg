@@ -4,6 +4,7 @@ pub mod endpoints;
 pub mod health;
 pub mod mesh;
 pub mod middleware;
+pub mod multicluster;
 pub mod observability;
 pub mod policies;
 pub mod rate_limit;

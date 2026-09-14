@@ -1,6 +1,6 @@
-{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.mesh.enabled }}
+{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.mesh.enabled .Values.router.multicluster.enabled }}
 apiVersion: rbac.authorization.k8s.io/v1
-{{- if .Values.router.serviceDiscovery.clusterWide }}
+{{- if or .Values.router.serviceDiscovery.clusterWide .Values.router.multicluster.clusterWide }}
 kind: ClusterRole
 {{- else }}
 kind: Role
@@ -13,4 +13,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+{{- if .Values.router.multicluster.enabled }}
+  # Read-only, and granted only when multi-cluster routing is on: the routing
+  # tables are written by the control plane and the gateway never edits them.
+  - apiGroups: ["ome.io"]
+    resources: ["trafficmaps"]
+    verbs: ["get", "list", "watch"]
+{{- end }}
 {{- end }}

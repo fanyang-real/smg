@@ -150,6 +150,19 @@ Called from the router Deployment template.
 - {{ .Values.router.serviceDiscovery.modelIdFrom | quote }}
 {{- end }}
 {{- end }}
+{{- if .Values.router.multicluster.enabled }}
+- "--multicluster-routing"
+{{- if .Values.router.multicluster.selector }}
+- "--trafficmap-selector"
+- {{ .Values.router.multicluster.selector | quote }}
+{{- end }}
+{{- if not .Values.router.multicluster.clusterWide }}
+- "--trafficmap-namespace"
+- {{ .Values.router.multicluster.namespace | default .Release.Namespace | quote }}
+{{- end }}
+- "--trafficmap-reconcile-interval-secs"
+- {{ .Values.router.multicluster.reconcileIntervalSecs | quote }}
+{{- end }}
 {{- if .Values.router.model }}
 - "--model-path"
 - {{ .Values.router.model | quote }}

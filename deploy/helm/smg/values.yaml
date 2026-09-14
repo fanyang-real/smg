@@ -46,6 +46,19 @@ router:
     # -- Extract model ID from pod metadata
     modelIdFrom: ""        # "namespace", "label:key", or "annotation:key"
 
+  # -- Route across clusters from control-plane-published TrafficMap routing
+  # tables. Each entry in a table becomes one backend: a whole remote cluster
+  # reached through its ingress, weighted by the share the control plane
+  # assigned it. Independent of serviceDiscovery above; enable either, both, or
+  # neither. Requires read on trafficmaps.ome.io, which the chart grants only
+  # when this is enabled.
+  multicluster:
+    enabled: false
+    clusterWide: false     # set true to watch all namespaces (requires ClusterRole/ClusterRoleBinding)
+    namespace: ""          # defaults to release namespace
+    selector: ""           # e.g. "routing.tier=global"; empty obeys every table in scope
+    reconcileIntervalSecs: 30
+
   # -- Model / tokenizer
   model: ""                # HuggingFace model ID or local path
   tokenizerPath: ""        # override tokenizer (defaults to model)

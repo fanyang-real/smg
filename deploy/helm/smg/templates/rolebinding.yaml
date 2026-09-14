@@ -1,6 +1,7 @@
-{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.mesh.enabled }}
+{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.mesh.enabled .Values.router.multicluster.enabled }}
+{{- $clusterWide := or .Values.router.serviceDiscovery.clusterWide .Values.router.multicluster.clusterWide }}
 apiVersion: rbac.authorization.k8s.io/v1
-{{- if .Values.router.serviceDiscovery.clusterWide }}
+{{- if $clusterWide }}
 kind: ClusterRoleBinding
 {{- else }}
 kind: RoleBinding
@@ -11,7 +12,7 @@ metadata:
     {{- include "smg.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  {{- if .Values.router.serviceDiscovery.clusterWide }}
+  {{- if $clusterWide }}
   kind: ClusterRole
   {{- else }}
   kind: Role

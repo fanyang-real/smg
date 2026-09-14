@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -19,6 +19,7 @@ use smg::{
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
+    multicluster::MultiClusterConfig,
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -629,6 +630,28 @@ struct CliArgs {
     /// Kubernetes namespace to watch for pods
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_namespace: Option<String>,
+
+    /// Route across clusters from control-plane-published TrafficMap routing
+    /// tables. Off by default: with it off the gateway behaves exactly as
+    /// before and never reads a routing table.
+    #[arg(long, default_value_t = false, help_heading = "Multi-Cluster Routing")]
+    multicluster_routing: bool,
+
+    /// Namespace to watch for routing tables. Unset watches every namespace,
+    /// which requires cluster-wide read on trafficmaps.ome.io.
+    #[arg(long, help_heading = "Multi-Cluster Routing")]
+    trafficmap_namespace: Option<String>,
+
+    /// Label selector narrowing which routing tables this gateway obeys
+    /// (format: key=value). Empty obeys every table in scope.
+    #[arg(long, num_args = 0.., help_heading = "Multi-Cluster Routing")]
+    trafficmap_selector: Vec<String>,
+
+    /// How often to reconcile remote homes even without a watch event, so a
+    /// dropped event or a failed registration cannot leave the backend set
+    /// wrong indefinitely.
+    #[arg(long, default_value_t = 30, help_heading = "Multi-Cluster Routing")]
+    trafficmap_reconcile_interval_secs: u64,
 
     /// Pod annotation containing the vLLM KV connector name
     #[arg(
@@ -2056,6 +2079,14 @@ impl CliArgs {
         // ==================== Mesh Server ====================
         let mesh_server_config = self.build_mesh_server_config()?;
 
+        let multicluster_config = self.multicluster_routing.then(|| MultiClusterConfig {
+            enabled: true,
+            namespace: self.trafficmap_namespace.clone(),
+            selector: Self::parse_selector(&self.trafficmap_selector),
+            check_interval: Duration::from_secs(self.trafficmap_reconcile_interval_secs),
+            ..MultiClusterConfig::default()
+        });
+
         Ok(ServerConfig {
             host: self.host.clone(),
             port: self.port,
@@ -2067,6 +2098,7 @@ impl CliArgs {
             log_level: Some(self.log_level.clone()),
             log_json: self.log_json,
             service_discovery_config,
+            multicluster_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {

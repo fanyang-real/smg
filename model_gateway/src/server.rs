@@ -50,6 +50,7 @@ use crate::{
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     middleware::{self, AdmissionQueue, AuthConfig},
+    multicluster::{start_multicluster_discovery, MultiClusterConfig},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -737,6 +738,9 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     pub log_json: bool,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    /// Consume control-plane-published routing tables and hold one backend per
+    /// remote serving cluster. `None` leaves multi-cluster routing off.
+    pub multicluster_config: Option<MultiClusterConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
@@ -1417,6 +1421,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
+    if let Some(multicluster_config) = config.multicluster_config {
+        if multicluster_config.enabled {
+            let app_context_arc = Arc::clone(&app_state.context);
+            match start_multicluster_discovery(multicluster_config, app_context_arc).await {
+                Ok(handle) => {
+                    info!("Multi-cluster routing started");
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "multi-cluster routing runs for the lifetime of the server"
+                    )]
+                    spawn(async move {
+                        if let Err(e) = handle.await {
+                            error!("Multi-cluster routing task failed: {:?}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    // Locally discovered and statically configured workers are
+                    // unaffected, so degrading to single-cluster routing beats
+                    // refusing to serve.
+                    error!("Failed to start multi-cluster routing: {e}");
+                    warn!("Continuing without multi-cluster routing");
+                }
+            }
+        }
+    }
+
     info!(
         "Router ready | workers: {:?}",
         WorkerManager::get_worker_urls(&app_state.context.worker_registry)
@@ -1637,6 +1668,7 @@ mod tests {
             log_level: None,
             log_json: false,
             service_discovery_config: None,
+            multicluster_config: None,
             prometheus_config: None,
             request_timeout_secs: 60,
             request_id_headers: None,
