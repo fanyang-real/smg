@@ -762,6 +762,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         None
     }
 
+    /// How long the worker has held prompts dispatched to it without
+    /// answering any: since its latest first response or, when the current
+    /// run of pending prompts began after that, since the run began (an idle
+    /// spell is no silence). `None` for a worker with nothing pending that
+    /// has answered none since the gateway started, or one that does not
+    /// track it.
+    fn prefill_silence(&self) -> Option<Duration> {
+        None
+    }
+
     /// Whether the engine behind the worker is on a prompt shape it has not
     /// shown it runs: a prompt pending on the worker, or one of `tokens`
     /// about to be dispatched, longer than any the worker has answered since
@@ -1987,6 +1997,10 @@ impl Worker for BasicWorker {
 
     fn prefill_answered_ago(&self) -> Option<Duration> {
         self.runtime.load().prefill_answered_ago()
+    }
+
+    fn prefill_silence(&self) -> Option<Duration> {
+        self.runtime.load().prefill_silence()
     }
 
     fn prefill_cold_shape(&self, tokens: u64) -> bool {

@@ -1525,7 +1525,8 @@ impl PrefillBound {
 /// The verdict on a prefill side that produced nothing within its bound, in
 /// `phase` (`dispatch`: the call returned no stream; `first_response`: the
 /// stream yielded nothing), while its worker answered no other side within
-/// the bound either (see [`liveness::prefill_side_reprieve`]): one WARN
+/// the bound, or within the time its backlog takes when longer, either (see
+/// [`liveness::prefill_side_reprieve`]): one WARN
 /// naming the worker, the request and how long ago the worker last
 /// answered anything, the worker-error counter under the timeout class, and
 /// the status the side's failure is reported with. Nothing else bounds this
@@ -1714,15 +1715,16 @@ fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -
 }
 
 /// Await a prefill side's dispatch within its bound. Past the deadline the
-/// side waits on while its worker keeps answering other sides (a bound past
-/// the worker's latest answer, re-read each time: see
-/// [`liveness::prefill_side_reprieve`]); once the worker has answered
-/// nothing for a bound, the still-pending call is retired off the request
-/// path (its room is aborted when it lands) and the silence verdict takes
-/// its place: the prefill's, or its decode `partner`'s when the partner had
-/// stalled mid-stream (see [`stalled_decode_partner`]; the parallel shape
-/// passes the decode worker, the sequential shape none). Without a bound or
-/// a worker to charge, the call is awaited as it is.
+/// side waits on while its worker keeps answering other sides or working
+/// through its backlog (a bound, or the backlog's time when longer, past the
+/// worker's latest answer or the start of its current run of prompts,
+/// re-read each time: see [`liveness::prefill_side_reprieve`]); once the
+/// worker has been silent that long, the still-pending call is retired off
+/// the request path (its room is aborted when it lands) and the silence
+/// verdict takes its place: the prefill's, or its decode `partner`'s when
+/// the partner had stalled mid-stream (see [`stalled_decode_partner`]; the
+/// parallel shape passes the decode worker, the sequential shape none).
+/// Without a bound or a worker to charge, the call is awaited as it is.
 async fn dispatch_prefill_within(
     bound: Option<PrefillBound>,
     mut dispatch: SideDispatch,
@@ -3422,6 +3424,122 @@ mod tests {
         assert!(
             elapsed >= shown_at + bound && elapsed < shown_at + 3 * bound,
             "given up on a bound after the shape was shown, not at its own bound: {elapsed:?}"
+        );
+    }
+
+    /// A worker that answered its last prompt and then sat idle, longer than
+    /// a bound, takes a burst of prompts no longer than it has answered (no
+    /// cold shape): the first side of the burst was dispatched to an empty
+    /// book, so its bound is short, and the burst booked behind it is what
+    /// the engine works through before it answers anything. The idle spell
+    /// is no silence, and a worker with that much pending is prefilling, not
+    /// frozen: the side waits on, and its call lands (here with a failure of
+    /// its own, which passes through) instead of the silence verdict at its
+    /// bound. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_in_a_burst_after_an_idle_spell_waits_on_past_its_bound() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        prefill.note_prefill_started(100_000, true);
+        prefill.note_prefill_ended(100_000, true, Some(0));
+        let bound = Duration::from_secs(1);
+        tokio::time::sleep(bound + Duration::from_millis(200)).await;
+        for _ in 0..40 {
+            prefill.note_prefill_started(100_000, true);
+        }
+        let started = Instant::now();
+        let result = dispatch_prefill_within(
+            Some(PrefillBound {
+                dispatched: started,
+                deadline: started + bound,
+                bound,
+            }),
+            answers_after(Duration::from_millis(2_500)),
+            Some(Arc::clone(&prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-burst-after-idle".to_string(),
+            100_000,
+        )
+        .await;
+        let status = failure(result);
+        assert!(
+            !is_prefill_silence(&status),
+            "a worker prefilling a burst is not frozen: {status:?}"
+        );
+        assert_eq!(status.message(), "late side");
+    }
+
+    /// The same burst on a worker that has answered nothing yet (a gateway
+    /// that just started, or a fresh worker): its silence counts from the
+    /// burst, and the side waits on while the burst has the time it needs.
+    /// (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_in_a_burst_on_a_worker_that_never_answered_waits_on_past_its_bound()
+    {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        for _ in 0..40 {
+            prefill.note_prefill_started(100_000, true);
+        }
+        let bound = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = dispatch_prefill_within(
+            Some(PrefillBound {
+                dispatched: started,
+                deadline: started + bound,
+                bound,
+            }),
+            answers_after(Duration::from_millis(2_500)),
+            Some(Arc::clone(&prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-cold-burst".to_string(),
+            100_000,
+        )
+        .await;
+        let status = failure(result);
+        assert!(
+            !is_prefill_silence(&status),
+            "a cold worker prefilling a burst is not frozen: {status:?}"
+        );
+        assert_eq!(status.message(), "late side");
+    }
+
+    /// A frozen worker is still given up on: with 20k prompt tokens pending
+    /// (two seconds at the cold prior) and nothing ever answered, a side
+    /// bounded at one second waits until the worker has been silent for the
+    /// time its backlog takes, and no longer. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_on_a_frozen_worker_is_given_up_on_once_its_backlog_had_its_time() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        for _ in 0..2 {
+            prefill.note_prefill_started(10_000, true);
+        }
+        let bound = Duration::from_secs(1);
+        let backlog = Duration::from_secs(2);
+        let started = Instant::now();
+        let result = dispatch_prefill_within(
+            Some(PrefillBound {
+                dispatched: started,
+                deadline: started + bound,
+                bound,
+            }),
+            never_answers(),
+            Some(Arc::clone(&prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-frozen".to_string(),
+            10_000,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= backlog && elapsed < backlog + bound,
+            "given up on once the backlog had its time: {elapsed:?}"
         );
     }
 

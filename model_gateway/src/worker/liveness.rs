@@ -96,12 +96,17 @@
 //!   disaggregated prefill side may stay silent ([`prefill_side_bound`]): a
 //!   side is not part of any pile, so its request is what fails, over to
 //!   another prefill worker when one is available. A side past its bound is
-//!   given up on only while its worker has answered nothing within the
-//!   bound ([`prefill_side_reprieve`]): a worker that keeps answering other
-//!   sides is backed up (on the parallel dispatch shape a side's first
-//!   response also waits for the decode side), not frozen, and its side
-//!   waits on; a side in flight when the longest prompt yet lands behind
-//!   it is given what is left of the cold-shape grace since its dispatch.
+//!   given up on only once its worker has been silent, judged as the pile
+//!   rule judges a worker, for the side's bound or, if longer, the time the
+//!   worker's whole backlog takes ([`prefill_side_reprieve`]): silent since
+//!   its latest first response, or since its current run of pending
+//!   prompts began when that came later (an idle spell is no silence). A
+//!   worker that keeps answering other sides, or is working through a burst
+//!   booked since its last answer, is backed up (on the parallel dispatch
+//!   shape a side's first response also waits for the decode side), not
+//!   frozen, and its side waits on; a side in flight when the longest
+//!   prompt yet lands behind it is given what is left of the cold-shape
+//!   grace since its dispatch.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -240,20 +245,27 @@ pub(crate) fn decode_side_bound(
 }
 
 /// Whether a prefill side past its own bound waits on, and how much longer.
-/// A side is given up on only when its worker is silent as a whole, with no
-/// first response on any prompt within the bound, as the pile rule judges
-/// a worker by its pile and not by one request. A worker that answered
-/// another side a moment ago is backed up, not frozen (on the parallel
-/// dispatch shape a side's first response also waits for the decode side to
-/// admit it), so the side waits until a bound has passed since that answer.
+/// A side is given up on only when its worker is silent as a whole, as the
+/// pile rule judges a worker by its pile and not by one request: no first
+/// response on any prompt for the side's bound or, if longer, the time its
+/// whole backlog takes ([`backlog_bound`]), counted from its latest answer
+/// or from the start of its current run of pending prompts, whichever is
+/// later ([`Worker::prefill_silence`]). A worker that answered another side
+/// a moment ago is backed up, not frozen (on the parallel dispatch shape a
+/// side's first response also waits for the decode side to admit it), so
+/// the side waits until a bound has passed since that answer; so is one
+/// that took a burst after an idle spell, or before it ever answered: the
+/// side dispatched first to its empty book has a short bound, and the burst
+/// booked behind it, which the engine may well serve first, has the time
+/// it takes.
 /// The bound was read at the side's dispatch, `dispatched_ago` back: a
 /// prompt longer than any the worker has answered that landed behind the
 /// side since blocks the engine for the side too while it builds, so while
 /// the worker is on that shape the side is given what is left of the
 /// cold-shape grace since its dispatch, as a side dispatched now would be
 /// ([`prefill_side_bound`]), a bound at a time so the shape's first token
-/// returns it to the rule above. `None` when the worker has answered
-/// nothing within the bound, or ever, and no grace is left: the verdict.
+/// returns it to the rule above. `None` when the worker has been silent
+/// for that long and no grace is left: the verdict.
 pub(crate) fn prefill_side_reprieve(
     worker: &Arc<dyn Worker>,
     bound: Duration,
@@ -261,19 +273,31 @@ pub(crate) fn prefill_side_reprieve(
 ) -> Option<Duration> {
     side_reprieve(
         cold_shape_grace(worker, 0),
-        worker.prefill_answered_ago(),
-        bound,
+        worker.prefill_silence(),
+        bound.max(backlog_bound(worker)),
         dispatched_ago,
     )
 }
 
+/// How long a worker that is prefilling, not frozen, may go without
+/// answering: the time its whole pending backlog takes at its measured
+/// prefill rate (the cold prior until one is measured), capped. A side's
+/// own bound covers its prompt behind what was pending at its dispatch; the
+/// prompts booked since, which the engine need not serve after it (on the
+/// parallel shape the decode side admits them in its own order), are in the
+/// backlog by the time that bound passes.
+fn backlog_bound(worker: &Arc<dyn Worker>) -> Duration {
+    worker.prefill_backlog().min(WEDGE_BOUND_CAP)
+}
+
 /// [`prefill_side_reprieve`] for a worker under a cold-shape `grace` (zero:
-/// on no such shape) whose latest first response was `answered_ago`
-/// (`None`: never). A grace the side's own bound already covers (a longer
+/// on no such shape) silent for `silent` (`None`: nothing pending and never
+/// answered), against `bound` (the side's own bound, or the worker's
+/// backlog when that is longer). A grace the bound already covers (a longer
 /// configured threshold) adds nothing.
 fn side_reprieve(
     grace: Duration,
-    answered_ago: Option<Duration>,
+    silent: Option<Duration>,
     bound: Duration,
     dispatched_ago: Duration,
 ) -> Option<Duration> {
@@ -285,15 +309,13 @@ fn side_reprieve(
             return Some(left.min(bound));
         }
     }
-    reprieve(answered_ago, bound)
+    reprieve(silent, bound)
 }
 
-/// [`prefill_side_reprieve`] for a worker whose latest first response was
-/// `answered_ago` (`None`: never).
-fn reprieve(answered_ago: Option<Duration>, bound: Duration) -> Option<Duration> {
-    bound
-        .checked_sub(answered_ago?)
-        .filter(|left| !left.is_zero())
+/// [`prefill_side_reprieve`] for a worker silent for `silent` (`None`:
+/// nothing pending and never answered).
+fn reprieve(silent: Option<Duration>, bound: Duration) -> Option<Duration> {
+    bound.checked_sub(silent?).filter(|left| !left.is_zero())
 }
 
 static THRESHOLDS: OnceLock<(Duration, Duration, Duration)> = OnceLock::new();
@@ -1221,6 +1243,24 @@ mod tests {
             prefill_side_reprieve(&w, bound, Duration::ZERO)
                 .is_some_and(|left| left > Duration::from_secs(2)),
             "answered just now: a bound's reprieve, less the moment since"
+        );
+    }
+
+    /// A burst booked on a worker that has answered nothing yet (a gateway
+    /// that just started, or a fresh worker), past a short side's bound:
+    /// the worker's silence counts from the burst, and a worker with that
+    /// much to prefill is prefilling, not frozen, for as long as the burst
+    /// takes at its rate (the cold prior here), up to the cap.
+    #[test]
+    fn a_prefill_side_waits_on_while_its_worker_prefills_a_burst() {
+        let w = worker();
+        for _ in 0..40 {
+            w.note_prefill_started(100_000, true);
+        }
+        let left = prefill_side_reprieve(&w, DEFAULT_WEDGE, DEFAULT_WEDGE);
+        assert!(
+            left.is_some_and(|left| left > Duration::from_secs(100)),
+            "forty 100k prompts pending: the side waits on, up to the cap: {left:?}"
         );
     }
 

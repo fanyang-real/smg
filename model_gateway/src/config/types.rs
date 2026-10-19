@@ -205,9 +205,11 @@ pub struct RouterConfig {
     /// answers polls, with requests in flight and a growing queue, after which
     /// new requests stop being routed to it until it makes progress. The same
     /// bound caps how long a disaggregated prefill side may produce nothing,
-    /// with its worker answering no other side, before its request fails over
-    /// to another prefill worker; on the parallel dispatch shape it must
-    /// cover the decode-side wait a side's first response may see.
+    /// with its worker answering no other side (for that long, or for the
+    /// time its whole prefill backlog takes when longer; an idle spell is not
+    /// counted), before its request fails over to another prefill worker; on
+    /// the parallel dispatch shape it must cover the decode-side wait a
+    /// side's first response may see.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
     /// Seconds without any contact from a worker whose KV-event stream pushes

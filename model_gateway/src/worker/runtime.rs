@@ -239,12 +239,18 @@ struct PrefillBook {
     /// The longest prompt answered with a first token (or one answer): the
     /// largest shape the engine has shown it runs; zero until one.
     longest_answered: u64,
+    /// Gateway clock at which `pending` last left zero: the start of the
+    /// current run of prompts waiting on the worker; zero while none is.
+    pending_since_ms: u64,
 }
 
 impl PrefillBook {
     fn started(&mut self, tokens: u64, timed: bool, now_ms: u64) {
         if tokens == 0 {
             return;
+        }
+        if self.pending == 0 {
+            self.pending_since_ms = now_ms;
         }
         self.pending = self.pending.saturating_add(tokens);
         *self.pending_prompts.entry(tokens).or_insert(0) += 1;
@@ -259,6 +265,9 @@ impl PrefillBook {
 
     fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
         self.pending = self.pending.saturating_sub(tokens);
+        if self.pending == 0 {
+            self.pending_since_ms = 0;
+        }
         self.forget_prompt(tokens);
         if cached.is_some() {
             self.last_answer_ms = now_ms;
@@ -340,6 +349,18 @@ impl PrefillBook {
     fn answered_ago(&self, now_ms: u64) -> Option<Duration> {
         (self.last_answer_ms > 0)
             .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
+    }
+
+    /// How long before `now_ms` the worker last showed it answers: its
+    /// latest answer or, when the current run of pending prompts began after
+    /// that, the start of the run. A spell with nothing pending is no
+    /// silence: a worker that answered everything it held and then sat idle
+    /// has been silent only since the next prompt reached it, and one that
+    /// has answered nothing yet since its first prompt did. `None` with
+    /// nothing pending and nothing ever answered.
+    fn silent_for(&self, now_ms: u64) -> Option<Duration> {
+        let since = self.last_answer_ms.max(self.pending_since_ms);
+        (since > 0).then(|| Duration::from_millis(now_ms.saturating_sub(since)))
     }
 
     /// Whether the engine is on a shape it has not shown it runs: a prompt
@@ -637,6 +658,15 @@ impl WorkerRuntime {
 
     pub fn prefill_cold_shape(&self, tokens: u64) -> bool {
         self.prefill.lock().cold_shape(tokens)
+    }
+
+    pub fn prefill_silence(&self) -> Option<Duration> {
+        self.prefill_silence_at(super::liveness::now_ms().max(1))
+    }
+
+    /// [`Self::prefill_silence`] as of `now_ms` on the gateway clock.
+    pub fn prefill_silence_at(&self, now_ms: u64) -> Option<Duration> {
+        self.prefill.lock().silent_for(now_ms)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -1146,6 +1176,49 @@ mod tests {
             runtime.prefill_answered_ago_at(7_000),
             Some(Duration::from_millis(500)),
             "a non-streaming generation's one answer counts too"
+        );
+    }
+
+    #[test]
+    fn a_workers_silence_counts_only_while_it_holds_prompts() {
+        // A prefill side past its own bound asks how long its worker has
+        // held prompts without answering any: since the latest answer, or
+        // since the current run of pending prompts began when that came
+        // later. An idle spell is no silence.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(runtime.prefill_silence_at(5_000), None, "nothing at all");
+        // Never answered: silent since its first prompt reached it.
+        runtime.note_prefill_started_at(1_000, true, 1_000);
+        runtime.note_prefill_started_at(1_000, true, 1_200);
+        assert_eq!(
+            runtime.prefill_silence_at(4_000),
+            Some(Duration::from_secs(3))
+        );
+        // A dropped stream is no answer, and the run goes on.
+        runtime.note_prefill_ended_at(1_000, true, None, 4_500);
+        assert_eq!(
+            runtime.prefill_silence_at(5_000),
+            Some(Duration::from_secs(4))
+        );
+        // An answer, then nothing pending: an idle minute.
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 6_000);
+        runtime.note_prefill_started_at(1_000, true, 66_000);
+        assert_eq!(
+            runtime.prefill_silence_at(67_000),
+            Some(Duration::from_secs(1)),
+            "silent since the burst after the idle minute, not since the answer before it"
+        );
+        assert_eq!(
+            runtime.prefill_answered_ago_at(67_000),
+            Some(Duration::from_secs(61)),
+            "the latest answer itself is still a minute back"
+        );
+        // An answer inside the run moves the clock.
+        runtime.note_prefill_started_at(1_000, true, 67_500);
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 68_000);
+        assert_eq!(
+            runtime.prefill_silence_at(69_000),
+            Some(Duration::from_secs(1))
         );
     }
 

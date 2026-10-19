@@ -844,13 +844,15 @@ struct WorkerArgs {
     /// non-streaming generations give no signal and never form one. The
     /// same bound, read per request, is how long a prefill side of a
     /// disaggregated dispatch may produce nothing, with its worker answering
-    /// no other side either, before its request fails over to another
-    /// prefill worker (or fails, when there is none); a side queued on a
-    /// worker that keeps answering waits on. On the parallel dispatch shape
-    /// a prefill side's first response also waits for the decode side (its
-    /// bootstrap, and KV pre-allocation under decode pressure), so the
-    /// threshold must cover that wait for a prefill worker with nothing
-    /// else to answer meanwhile. 0 disables both.
+    /// no other side either (for that long, or for the time its whole
+    /// prefill backlog takes when longer; an idle spell is not counted),
+    /// before its request fails over to another prefill worker (or fails,
+    /// when there is none); a side queued on a worker that keeps answering
+    /// waits on. On the parallel dispatch shape a prefill side's first
+    /// response also waits for the decode side (its bootstrap, and KV
+    /// pre-allocation under decode pressure), so the threshold must cover
+    /// that wait for a prefill worker with nothing else to answer
+    /// meanwhile. 0 disables both.
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 
