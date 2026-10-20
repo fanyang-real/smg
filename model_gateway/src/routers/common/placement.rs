@@ -895,7 +895,8 @@ fn relaxed_pair(
 /// from that role's candidates the request may use. A pool whose every
 /// worker the request may use is over the overload thresholds is judged as
 /// if none were, and placed by its own policy: the veto has nowhere to steer
-/// within it.
+/// within it. A prefill pool whose policy balances load against cache
+/// affinity itself is never steered by the veto.
 #[expect(
     clippy::too_many_arguments,
     reason = "pair placement threads every routing input plus the admission view"
@@ -926,14 +927,29 @@ pub(crate) fn select_pair(
     // re-pick a prefill its own pool never vetoed. Under
     // `--worker-overload-shed` such a pool is shed instead.
     let shedding = registry.overload_shed_enabled();
-    let lifted = |pool: &[Arc<dyn Worker>]| {
-        !shedding
-            && !pool.iter().any(|w| admitted(w) && w.is_available())
-            && pool
-                .iter()
-                .any(|w| admitted(w) && overload::vetoed_by_overload_alone(w.as_ref()))
+    let vetoed_alone = |pool: &[Arc<dyn Worker>]| {
+        pool.iter()
+            .any(|w| admitted(w) && overload::vetoed_by_overload_alone(w.as_ref()))
     };
-    let lift_prefill = lifted(&pairs.prefill);
+    let lifted = |pool: &[Arc<dyn Worker>]| {
+        !shedding && !pool.iter().any(|w| admitted(w) && w.is_available()) && vetoed_alone(pool)
+    };
+    // Independent prefill/decode policies so stateful ones (round robin) do
+    // not share a counter; each role tags the sticky key with its own prefix.
+    let prefill_policy = policies.get_prefill_policy();
+    let decode_policy = policies.get_decode_policy();
+    let prefill_over = lifted(&pairs.prefill);
+    // Nor does the veto steer a prefill pool whose policy weighs load
+    // against cache affinity itself: under sustained load the prefill
+    // workers take turns crossing the thresholds, and every crossing would
+    // send the sessions whose prefixes that worker holds to another one,
+    // discarding their cache and pushing that worker over in turn. The
+    // policy's own gate moves a request off a holder loaded well past the
+    // pool (`LoadBalancingPolicy::balances_load_against_affinity`).
+    let lift_prefill = prefill_over
+        || (!shedding
+            && prefill_policy.balances_load_against_affinity()
+            && vetoed_alone(&pairs.prefill));
     let lift_decode = lifted(&pairs.decode_pool);
     let eligible = |w: &Arc<dyn Worker>, lift: bool| {
         admitted(w)
@@ -1058,11 +1074,6 @@ pub(crate) fn select_pair(
         ));
     }
 
-    // Independent prefill/decode policies so stateful ones (round robin) do
-    // not share a counter; each role tags the sticky key with its own prefix.
-    let prefill_policy = policies.get_prefill_policy();
-    let decode_policy = policies.get_decode_policy();
-
     // Under Prefill admission, workers at their limit leave the candidate set
     // before the policy runs, so a stateful policy never commits a choice
     // the reservation then refuses.
@@ -1156,11 +1167,11 @@ pub(crate) fn select_pair(
                 .ok_or_else(|| declined(WorkerRole::Decode, decode_policy.name()))?,
             None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
         };
-    if lift_prefill || lift_decode {
+    if prefill_over || lift_decode {
         Metrics::record_worker_overload_fallback(STAGE_SELECTION);
         debug!(
             branch = BRANCH_ALL_OVERLOADED_FALLBACK,
-            prefill_pool = lift_prefill,
+            prefill_pool = prefill_over,
             decode_pool = lift_decode,
             prefill = %selected_prefill.url(),
             decode = %selected_decode.url(),
@@ -2597,19 +2608,62 @@ mod tests {
         );
     }
 
-    /// The veto still steers where it can: with one prefill worker over the
-    /// thresholds and the other under them, the session's turn goes to the
-    /// one under them, as before.
+    /// One prefill worker over the thresholds beside one under them, as the
+    /// two take turns under sustained load: cache-aware prefill placement is
+    /// not steered by the veto, so the session stays on the prefill worker
+    /// holding its prefix.
     #[test]
-    fn an_overloaded_prefill_beside_one_under_the_thresholds_is_still_steered_around() {
+    fn an_overloaded_prefill_holding_the_prefix_keeps_the_session_under_cache_aware() {
         let (registry, policies) = cache_aware_pd();
         let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
         registry.set_worker_overloaded(&home, true);
+        for _ in 0..4 {
+            assert_eq!(
+                place_prompt(&registry, &policies, &next_turn).prefill.url(),
+                home.url(),
+                "the veto moved the session off the prefill holding its prefix"
+            );
+        }
+    }
+
+    /// Cache-aware's own gate still moves a request off an overloaded holder
+    /// loaded well past the pool: the spill the veto no longer forces.
+    #[test]
+    fn a_saturated_overloaded_holder_still_spills_under_cache_aware() {
+        let (registry, policies) = cache_aware_pd();
+        let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
+        registry.set_worker_overloaded(&home, true);
+        for _ in 0..27 {
+            home.increment_load();
+        }
         assert_ne!(
             place_prompt(&registry, &policies, &next_turn).prefill.url(),
             home.url(),
-            "the veto steers to the prefill under the thresholds"
+            "the count-pressure gate spills off the saturated holder"
         );
+    }
+
+    /// A prefill policy that does not weigh load against affinity keeps the
+    /// veto: with one prefill worker over the thresholds and the other under
+    /// them, every pick goes to the one under them.
+    #[test]
+    fn an_overloaded_prefill_beside_one_under_the_thresholds_is_still_steered_around() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let over = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&over, true);
+        let prompt: Vec<u32> = (0..8_192).collect();
+        for _ in 0..4 {
+            assert_eq!(
+                place_prompt(&registry, &policies, &prompt).prefill.url(),
+                "grpc://p:2",
+                "the veto steers to the prefill under the thresholds"
+            );
+        }
     }
 
     /// A prefill pool the liveness tracker vetoes in full keeps the
