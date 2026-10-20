@@ -102,10 +102,8 @@ pub fn all_vetoed(candidates: &[Arc<dyn Worker>]) -> bool {
 /// alone: over them, and otherwise routable (ready, circuit closed, not
 /// vetoed by the liveness tracker).
 pub fn vetoed_by_overload_alone(worker: &dyn Worker) -> bool {
-    worker.is_overloaded()
-        && worker.is_healthy()
-        && worker.circuit_breaker_can_execute()
-        && worker.stall_reason().is_none()
+    let state = worker.routing_state();
+    state.overloaded && state.eligible_ignoring_overload()
 }
 
 /// The steering answer to a pool whose every worker is vetoed: the

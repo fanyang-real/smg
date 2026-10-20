@@ -274,8 +274,8 @@ impl Default for BucketConfig {
 /// circuit-breaker test it already performed, under the same guards and with
 /// the same short-circuit order — the veto is one more test on a word already
 /// in hand, never a second walk. A selection whose caller lifted that veto
-/// ([`SelectWorkerInfo::overload_lifted`]) also takes the workers it alone
-/// keeps out.
+/// ([`SelectWorkerInfo::overload_lifted`]) tests every other veto instead
+/// ([`RoutingState::eligible_ignoring_overload`]).
 pub(crate) fn get_healthy_worker_indices(
     workers: &[Arc<dyn Worker>],
     info: &SelectWorkerInfo,
@@ -284,7 +284,11 @@ pub(crate) fn get_healthy_worker_indices(
         .iter()
         .enumerate()
         .filter(|(_, w)| {
-            w.is_available() || (info.overload_lifted && info.admits(w.routing_state()))
+            if info.overload_lifted {
+                w.routing_state().eligible_ignoring_overload()
+            } else {
+                w.is_available()
+            }
         })
         .map(|(idx, _)| idx)
         .collect()
@@ -370,11 +374,14 @@ pub struct SelectWorkerInfo<'a> {
 
 impl SelectWorkerInfo<'_> {
     /// Whether a worker in routing `state` is a candidate for this
-    /// selection: eligible, or kept out by the overload veto alone when the
-    /// caller lifted that veto ([`Self::overload_lifted`]).
+    /// selection: [`RoutingState::eligible`], or every veto but the overload
+    /// one when the caller lifted that veto ([`Self::overload_lifted`]).
     pub(crate) fn admits(&self, state: RoutingState) -> bool {
-        state.eligible()
-            || (self.overload_lifted && state.healthy && state.can_execute && !state.stalled)
+        if self.overload_lifted {
+            state.eligible_ignoring_overload()
+        } else {
+            state.eligible()
+        }
     }
 }
 

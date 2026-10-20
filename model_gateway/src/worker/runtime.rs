@@ -71,11 +71,18 @@ pub struct RoutingState {
 }
 
 impl RoutingState {
+    /// Every routing veto but the absolute overload one: ready, circuit
+    /// breaker closed or half-open, not stalled. What a selection that lifted
+    /// the overload veto routes on (`SelectWorkerInfo::overload_lifted`).
+    pub const fn eligible_ignoring_overload(self) -> bool {
+        self.healthy && self.can_execute && !self.stalled
+    }
+
     /// The full routing eligibility test. Costs nothing beyond the reads the
     /// gather pass already performed: every field rides the one guard
     /// [`Worker::routing_state`] took.
     pub const fn eligible(self) -> bool {
-        self.healthy && self.can_execute && !self.overloaded && !self.stalled
+        self.eligible_ignoring_overload() && !self.overloaded
     }
 }
 
