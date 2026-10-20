@@ -507,10 +507,10 @@ struct RoutingArgs {
     /// --worker-overload-waiting-requests or --worker-overload-token-usage is
     /// left out of routing while another worker is under them; when every
     /// worker is over them the request goes to the least-loaded one, unless
-    /// --worker-overload-shed asks for a 503 instead. A cache-aware prefill
-    /// pool of gRPC and HTTP prefill/decode pair placement is not steered by
-    /// them at all: its spill gate balances it. Evaluated once per load
-    /// report, never per request. Per-worker `overload` blocks on a
+    /// --worker-overload-shed asks for a 503 instead. Unless
+    /// --worker-overload-shed is set, a cache-aware prefill pool of gRPC and
+    /// HTTP prefill/decode pair placement is not steered by them: its spill
+    /// gate balances it. Evaluated once per load report, never per request. Per-worker `overload` blocks on a
     /// WorkerSpec override the gateway values per signal
     #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,

@@ -277,9 +277,9 @@ pub struct RouterConfig {
     /// report is at or above either threshold below is left out of routing
     /// while another worker is under them; when every worker is over them the
     /// request goes to the least-loaded one (see `worker_overload_shed` for
-    /// refusing instead). A cache-aware prefill pool of gRPC and HTTP
-    /// prefill/decode pair placement is not steered by them at all: its
-    /// spill gate balances it.
+    /// refusing instead). Unless `worker_overload_shed` is set, a
+    /// cache-aware prefill pool of gRPC and HTTP prefill/decode pair
+    /// placement is not steered by them: its spill gate balances it.
     /// Evaluated once per ingested load report, never per request. `false`
     /// switches both gateway thresholds off; per-worker `overload` blocks on
     /// a WorkerSpec still apply.
