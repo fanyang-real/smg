@@ -1102,8 +1102,9 @@ async fn spec_decode_counts_reach_the_complete() {
 }
 
 /// The grammar backend on every structured request is the engine's
-/// configured one (`auto` settles on xgrammar as vLLM's frontend does), not
-/// a per-constraint guess: the engine pins one backend at first use.
+/// configured one (`auto` settles on xgrammar, the backend structural tags
+/// compile on), not a per-constraint guess: the engine pins one backend at
+/// first use.
 #[tokio::test]
 async fn structured_output_backend_follows_the_launcher_config() {
     use vllm::sampling_params::Constraint;
@@ -1134,10 +1135,10 @@ async fn structured_output_backend_follows_the_launcher_config() {
         h.server.stop(Duration::from_secs(5)).expect("clean stop");
     }
 
-    // `auto` resolves per constraint as vLLM's frontend does: a Lark grammar
-    // goes to xgrammar unchanged (vLLM 0.30 parses Lark there), a schema with
-    // a feature xgrammar lacks goes to guidance, and a choice is lowered to
-    // the grammar xgrammar compiles. The streams stay open so no abort
+    // `auto` is xgrammar for every constraint: a Lark grammar goes there
+    // unchanged (vLLM 0.30 parses Lark there) and a choice is lowered to the
+    // grammar xgrammar compiles; a schema with a feature xgrammar lacks is
+    // refused before the engine (below). The streams stay open so no abort
     // interleaves with the engine's inbound requests.
     let mut h = harness(model_info(), None).await;
     let lark = "start: \"yes\" | \"no\"";
@@ -1148,14 +1149,6 @@ async fn structured_output_backend_follows_the_launcher_config() {
             Constraint::Grammar(lark.to_string()),
             StructuredOutputBackend::Xgrammar,
             StructuredOutputConstraint::Grammar(lark.to_string()),
-        ),
-        (
-            "so3",
-            Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
-            StructuredOutputBackend::Guidance,
-            StructuredOutputConstraint::Json(
-                serde_json::json!({"type": "integer", "multipleOf": 3}),
-            ),
         ),
         (
             "so4",
@@ -1183,6 +1176,16 @@ async fn structured_output_backend_follows_the_launcher_config() {
         assert_eq!(structured.backend, expected_backend, "{id}");
         assert_eq!(structured.constraint, expected_constraint, "{id}");
     }
+    // A schema with a feature xgrammar lacks is refused under `auto` before it
+    // reaches the engine, as vLLM's frontend refuses it under
+    // `backend=xgrammar`: xgrammar would compile it with the keyword dropped
+    // and the engine would answer off the schema.
+    let mut request = generate_request("so3", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonSchema(
+        r#"{"type":"integer","multipleOf":3}"#.to_string(),
+    ));
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
     drop(streams);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -1460,6 +1463,56 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     }
     assert_eq!(relay.counts().served_from_history, 1);
     drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Deferred requests survive the wire, adapter, gRPC poll and KV load record,
+/// remain rank-local, and disappear when the engine drains its queues.
+#[tokio::test]
+async fn remote_kv_waiting_load_is_reported_per_rank() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model).await;
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    for (runnable, deferred) in [(0_u64, 4_u64), (3, 4), (0, 0)] {
+        let expected_total = i32::try_from(runnable + deferred).unwrap();
+        let expected_record_total = u32::try_from(expected_total).unwrap();
+        rank1_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 1,
+                scheduler_stats: Some(Box::new(SchedulerStats {
+                    num_waiting_reqs: runnable,
+                    num_skipped_waiting_reqs: deferred,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        wait_until(|| {
+            h.server.state.engine().is_ok_and(|client| {
+                client
+                    .get_loads()
+                    .loads
+                    .iter()
+                    .any(|load| load.dp_rank == 1 && load.num_waiting_reqs == expected_total)
+            })
+        })
+        .await;
+        let loads = h
+            .client
+            .get_loads(vllm::GetLoadsRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(loads.loads.len(), 1);
+        let load = &loads.loads[0];
+        assert_eq!(load.dp_rank, 1);
+        assert_eq!(load.num_waiting_reqs, expected_total);
+        let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
+        assert_eq!(record.waiting_requests, expected_record_total);
+        assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+    }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

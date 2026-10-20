@@ -16,7 +16,10 @@ use engine_zmq_client::{
         output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
         request::{EngineCoreRequest, MmFeaturesPayload},
         sampling::EngineCoreSamplingParams,
-        structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
+        structured_outputs::{
+            has_xgrammar_unsupported_json_features, StructuredOutputBackend,
+            StructuredOutputsParams,
+        },
     },
 };
 use futures::Stream;
@@ -449,19 +452,44 @@ pub(crate) fn translate_request(
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
 ) -> Result<EngineCoreRequest, String> {
-    translate_request_with_backend(req, max_model_len, model_dtype, eos, None)
+    translate_request_with_backend(
+        req,
+        max_model_len,
+        model_dtype,
+        eos,
+        StructuredOutputsBackendConfig::default(),
+    )
 }
 
 /// The engine's `--structured-outputs-config.backend`, as it bears on the
-/// `_backend` this translation stamps on structured requests: `auto` (vLLM's
-/// default) resolves per constraint the way vLLM's frontend does
-/// ([`StructuredOutputsParams::with_auto_backend`]); an explicit backend is
-/// pinned on every request. The engine keeps the backend of its first
-/// structured request, as it does behind vLLM's own frontend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `_backend` this translation stamps on structured requests. The engine
+/// keeps the backend of its first structured request for its life, so the
+/// stamp is a per-engine pin, not a per-request choice: under `auto` (vLLM's
+/// default, and the state of a connection nothing configured) every
+/// constraint carries xgrammar, the one backend that compiles a structural
+/// tag in the triggered-tags format; vLLM's own frontend would send a JSON
+/// schema with features xgrammar lacks to guidance instead, which on a
+/// single-backend engine pins guidance when it comes first and fails every
+/// structural tag after it; such a schema is refused here before it reaches
+/// the engine ([`refuse_schema_xgrammar_cannot_enforce`]), as vLLM's frontend
+/// refuses it under `backend=xgrammar`, because xgrammar would compile it with
+/// the unsupported keywords dropped and answer off the schema. An explicit
+/// backend is pinned on every request as configured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StructuredOutputsBackendConfig {
+    #[default]
     Auto,
     Pinned(StructuredOutputBackend),
+}
+
+impl StructuredOutputsBackendConfig {
+    /// The backend every structured request carries under this config.
+    pub fn backend(self) -> StructuredOutputBackend {
+        match self {
+            Self::Auto => StructuredOutputBackend::Xgrammar,
+            Self::Pinned(backend) => backend,
+        }
+    }
 }
 
 /// [`StructuredOutputsBackendConfig`] from the configured backend name.
@@ -635,16 +663,15 @@ pub(crate) fn translated_from_processed(
     processed.into_translated(req, model_dtype)
 }
 
-/// [`translate_request`] with the grammar backend configured for the engine
-/// (`None` keeps the per-constraint default of the translation); the
-/// request's media is translated inline.
+/// [`translate_request`] with the grammar backend configured for the engine;
+/// the request's media is translated inline.
 #[cfg(test)]
 pub(crate) fn translate_request_with_backend(
     mut req: vllm::GenerateRequest,
     max_model_len: u64,
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    structured_backend: StructuredOutputsBackendConfig,
 ) -> Result<EngineCoreRequest, String> {
     let media = translate_media(&mut req, model_dtype)?;
     translate_request_with_media(req, media, max_model_len, eos, structured_backend)
@@ -657,7 +684,7 @@ pub(crate) fn translate_request_with_media(
     media: TranslatedMedia,
     max_model_len: u64,
     eos: &EosTokenIds,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    structured_backend: StructuredOutputsBackendConfig,
 ) -> Result<EngineCoreRequest, String> {
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
@@ -683,6 +710,7 @@ pub(crate) fn translate_request_with_media(
         u32::try_from(max_model_len.saturating_sub(prompt_len)).unwrap_or(u32::MAX);
     if let Some(sp) = req.sampling_params.as_ref() {
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
+        refuse_schema_xgrammar_cannot_enforce(sp, structured_backend)?;
     }
     let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
         (None, false) => None,
@@ -742,7 +770,7 @@ pub(crate) fn translate_sampling(
     default_max_tokens: u32,
     eos: &EosTokenIds,
     kv_transfer_params: Option<serde_json::Value>,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    structured_backend: StructuredOutputsBackendConfig,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
     // `_eos_token_id`, extra ids merge into `stop_token_ids`, and the union
@@ -798,15 +826,10 @@ pub(crate) fn translate_sampling(
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
-        structured_outputs: sp.constraint.and_then(translate_constraint).map(|params| {
-            match structured_backend {
-                None => params,
-                Some(StructuredOutputsBackendConfig::Auto) => params.with_auto_backend(),
-                Some(StructuredOutputsBackendConfig::Pinned(backend)) => {
-                    params.with_backend(backend)
-                }
-            }
-        }),
+        structured_outputs: sp
+            .constraint
+            .and_then(translate_constraint)
+            .map(|params| params.with_backend(structured_backend.backend())),
         extra_args: kv_transfer_params
             .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
         ..EngineCoreSamplingParams::default()
@@ -889,9 +912,41 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
     Ok(())
 }
 
-/// Map the proto `constraint` oneof onto typed structured-output params. The
-/// backend defaults to guidance engine-side; `json_object=false` selects no
-/// constraint (the caller opted out), so it maps to `None`.
+/// vLLM's frontend refuses a JSON schema with features xgrammar does not
+/// compile when the backend is xgrammar (`validate_xgrammar_grammar`, a 400):
+/// xgrammar's converter drops those keywords and the engine answers off the
+/// schema with a 200. The same refusal here for every config that resolves to
+/// xgrammar, `auto` included; a backend that enforces such a schema itself
+/// takes it as is. The constraint is one `JsonSchema` whatever built it: a
+/// `response_format` schema, or the tool parameters of a forced tool call on
+/// a parser without structural tags; the message names both.
+pub(crate) fn refuse_schema_xgrammar_cannot_enforce(
+    sp: &vllm::SamplingParams,
+    structured_backend: StructuredOutputsBackendConfig,
+) -> Result<(), String> {
+    if structured_backend.backend() != StructuredOutputBackend::Xgrammar {
+        return Ok(());
+    }
+    let Some(vllm::sampling_params::Constraint::JsonSchema(schema)) = sp.constraint.as_ref() else {
+        return Ok(());
+    };
+    if has_xgrammar_unsupported_json_features(&serde_json::Value::String(schema.clone())) {
+        return Err(
+            "The JSON schema constraint (a response_format schema, or the tool parameters of a \
+             forced tool call) contains features not supported by xgrammar, the \
+             structured-output backend this engine runs (multipleOf; uniqueItems or contains; \
+             an unsupported string format; minLength/maxLength beside pattern or format; \
+             propertyNames or patternProperties beside other property keywords)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Map the proto `constraint` oneof onto typed structured-output params (the
+/// backend is pinned by the caller, [`translate_sampling`]);
+/// `json_object=false` selects no constraint (the caller opted out), so it
+/// maps to `None`.
 pub(crate) fn translate_constraint(
     constraint: vllm::sampling_params::Constraint,
 ) -> Option<StructuredOutputsParams> {
@@ -1664,9 +1719,10 @@ mod tests {
             structured_outputs_backend_from_config("xgrammar:disable-any-whitespace"),
             Pinned(StructuredOutputBackend::Xgrammar)
         );
-        // `auto` (and anything unknown) resolves per constraint.
+        // `auto` (and anything unknown) is the engine's own default.
         assert_eq!(structured_outputs_backend_from_config("auto"), Auto);
         assert_eq!(structured_outputs_backend_from_config(""), Auto);
+        assert_eq!(StructuredOutputsBackendConfig::default(), Auto);
 
         let constrained = || {
             tokenized_req(vllm::SamplingParams {
@@ -1687,11 +1743,11 @@ mod tests {
             4096,
             ModelDtype::BFloat16,
             &EosTokenIds::default(),
-            Some(Pinned(StructuredOutputBackend::Guidance)),
+            Pinned(StructuredOutputBackend::Guidance),
         )
         .expect("translated");
         assert_eq!(backend_of(request), StructuredOutputBackend::Guidance);
-        // Unpinned: the translation's own per-constraint default.
+        // Nothing configured: the engine's `auto`.
         let request = translate_request(
             constrained(),
             4096,
@@ -1699,12 +1755,12 @@ mod tests {
             &EosTokenIds::default(),
         )
         .expect("translated");
-        assert_eq!(backend_of(request), StructuredOutputBackend::default());
+        assert_eq!(backend_of(request), StructuredOutputBackend::Xgrammar);
 
-        // `auto`: vLLM's per-constraint resolution. A Lark grammar goes to
-        // xgrammar unchanged (vLLM 0.30 parses Lark there); a schema with a
-        // feature xgrammar lacks goes to guidance; a choice headed for
-        // xgrammar is lowered to the grammar vLLM's frontend substitutes.
+        // `auto`: xgrammar for every constraint, the engine's one backend
+        // being the one structural tags compile on. A Lark grammar goes to
+        // xgrammar unchanged (vLLM 0.30 parses Lark there); a choice is
+        // lowered to the grammar vLLM's frontend substitutes.
         let auto = |constraint| {
             translate_request_with_backend(
                 tokenized_req(vllm::SamplingParams {
@@ -1714,7 +1770,7 @@ mod tests {
                 4096,
                 ModelDtype::BFloat16,
                 &EosTokenIds::default(),
-                Some(Auto),
+                Auto,
             )
             .expect("translated")
             .sampling_params
@@ -1728,10 +1784,6 @@ mod tests {
             params.constraint,
             StructuredOutputConstraint::Grammar(lark.to_string())
         );
-        let params = auto(vllm::sampling_params::Constraint::JsonSchema(
-            r#"{"type":"integer","multipleOf":3}"#.to_string(),
-        ));
-        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
         let params = auto(vllm::sampling_params::Constraint::Choice(
             vllm::ChoiceConstraint {
                 choices: vec!["a".to_string(), "b".to_string()],
@@ -1742,6 +1794,79 @@ mod tests {
             params.constraint,
             StructuredOutputConstraint::Grammar("root ::= \"a\" | \"b\"".to_string())
         );
+    }
+
+    /// A JSON schema with a feature xgrammar lacks (vLLM's own static check)
+    /// is refused before it reaches the engine wherever the resolved backend
+    /// is xgrammar, `auto` included, as vLLM's frontend refuses it under
+    /// `backend=xgrammar`: xgrammar would compile it with the keyword dropped
+    /// and the engine would answer off the schema. A pinned guidance enforces
+    /// such a schema and takes it as is. The tool parameters of a forced tool
+    /// call reach this translation as the same `JsonSchema` constraint (a
+    /// parser without structural tags builds one from the tools), so a tool
+    /// whose parameters use such a keyword is refused the same way.
+    #[test]
+    fn a_schema_xgrammar_cannot_enforce_is_refused_wherever_xgrammar_is_the_backend() {
+        use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputConstraint;
+        use StructuredOutputsBackendConfig::{Auto, Pinned};
+        let schema = |text: &str| {
+            tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::JsonSchema(
+                    text.to_string(),
+                )),
+                ..Default::default()
+            })
+        };
+        let translate = |request, config| {
+            translate_request_with_backend(
+                request,
+                4096,
+                ModelDtype::BFloat16,
+                &EosTokenIds::default(),
+                config,
+            )
+        };
+        let multiple_of = r#"{"type":"integer","multipleOf":3}"#;
+        for config in [Auto, Pinned(StructuredOutputBackend::Xgrammar)] {
+            let refused = translate(schema(multiple_of), config).expect_err("refused");
+            assert!(
+                refused.contains("not supported by xgrammar"),
+                "{config:?}: {refused}"
+            );
+        }
+        // The parameters of a forced tool call, as a tool-call parser without
+        // structural tags sends them: an array parameter with `uniqueItems`.
+        let tool_parameters = r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["tags"]}"#;
+        let refused = translate(schema(tool_parameters), Auto).expect_err("refused");
+        assert!(
+            refused.contains("tool parameters of a forced tool call"),
+            "{refused}"
+        );
+        let params = translate(
+            schema(multiple_of),
+            Pinned(StructuredOutputBackend::Guidance),
+        )
+        .expect("translated")
+        .sampling_params
+        .and_then(|sp| sp.structured_outputs)
+        .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+        assert_eq!(
+            params.constraint,
+            StructuredOutputConstraint::Json(
+                serde_json::json!({"type": "integer", "multipleOf": 3})
+            )
+        );
+        // A schema xgrammar compiles whole passes under `auto`.
+        let params = translate(
+            schema(r#"{"type":"object","properties":{"city":{"type":"string"}}}"#),
+            Auto,
+        )
+        .expect("translated")
+        .sampling_params
+        .and_then(|sp| sp.structured_outputs)
+        .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
     }
 
     #[test]
@@ -1862,15 +1987,15 @@ mod tests {
             .structured_outputs
         };
 
-        // Each constraint mode maps onto its typed counterpart, always lowering
-        // to the guidance backend engine-side.
+        // Each constraint mode maps onto its typed counterpart, under the
+        // engine's `auto` backend when nothing configured one.
         let json_object = translate(vllm::sampling_params::Constraint::JsonObject(true))
             .expect("json_object translated");
         assert_eq!(
             json_object.constraint,
             StructuredOutputConstraint::JsonObject
         );
-        assert_eq!(json_object.backend, StructuredOutputBackend::Guidance);
+        assert_eq!(json_object.backend, StructuredOutputBackend::Xgrammar);
 
         let regex = translate(vllm::sampling_params::Constraint::Regex("a.*".to_string()))
             .expect("regex translated");
@@ -1879,6 +2004,8 @@ mod tests {
             StructuredOutputConstraint::Regex("a.*".to_string())
         );
 
+        // A choice is lowered to the grammar xgrammar compiles, as vLLM's
+        // frontend does before it sends one there.
         let choice = translate(vllm::sampling_params::Constraint::Choice(
             vllm::ChoiceConstraint {
                 choices: vec!["yes".to_string(), "no".to_string()],
@@ -1887,7 +2014,7 @@ mod tests {
         .expect("choice translated");
         assert_eq!(
             choice.constraint,
-            StructuredOutputConstraint::Choice(vec!["yes".to_string(), "no".to_string()])
+            StructuredOutputConstraint::Grammar("root ::= \"yes\" | \"no\"".to_string())
         );
 
         // A JSON schema string is parsed to preserve object shape.

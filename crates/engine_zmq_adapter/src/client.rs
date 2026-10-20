@@ -35,7 +35,7 @@ use crate::{
         translate_embed_request_sglang, translate_request_sglang, SglangGenerateStream,
         SglangProfileStart,
     },
-    sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake, ZMQ_CONNECT_TIMEOUT},
+    sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::ZmqGenerateStream,
     tokenspeed::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed_for, GridTensors,
@@ -103,8 +103,8 @@ pub(crate) struct ZmqConnectionMeta {
     /// than on the client so every clone shares the one adoption.
     tokenizer_eos: OnceLock<EosTokenIds>,
     /// The engine's structured-output backend config, set once by the caller
-    /// that knows it (the servicer); unset keeps the translation's
-    /// per-constraint default.
+    /// that knows it (the servicer); unset is the engine's `auto`
+    /// ([`StructuredOutputsBackendConfig::default`]).
     structured_outputs_backend: OnceLock<StructuredOutputsBackendConfig>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
@@ -116,14 +116,19 @@ pub(crate) struct ZmqConnectionMeta {
 /// by the worker's background handshake driver. `model_id` is
 /// the config-resolved served model (EngineCore reports none). `engine_count`
 /// is the number of DP engines that will dial this worker's sockets (1 for an
-/// ungrouped worker). Errors are plain reasons; the worker layer wraps them in
-/// its own error type.
+/// ungrouped worker). `startup` is the longest any one stage of the handshake
+/// (an engine's HELLO, its READY, its registration on the input socket) may
+/// stay silent: the gateway did not launch the engine and sees no sign of
+/// life from it beside the wire, so this bound alone must cover the engine's
+/// init between its HELLO and its READY. Errors are plain reasons; the worker
+/// layer wraps them in its own error type.
 pub async fn connect_for_worker(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<&str>,
     engine_count: usize,
+    startup: Duration,
 ) -> Result<ZmqEngineClient, String> {
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
@@ -149,7 +154,7 @@ pub async fn connect_for_worker(
         Handshake::registered(handshake_override),
         engine_count,
         eos,
-        ZMQ_CONNECT_TIMEOUT,
+        startup,
     )
     .await
 }
@@ -159,9 +164,10 @@ pub async fn connect_for_worker(
 /// the handshake. For a frontend that already knows the model's EOS ids from
 /// the engine's own config (the Rust gRPC servicer) and has no model dir to
 /// read them from. `startup` bounds the handshake: the gateway's connector
-/// passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own engine
-/// passes a [`StartupBudget`] shaped by what that engine's start may take
-/// and by the signs of life it sees from the engine process. `handshake` is
+/// passes its configured per-stage bound as a plain [`Duration`]; a servicer
+/// that launches its own engine passes a [`StartupBudget`] shaped by what
+/// that engine's start may take and by the signs of life it sees from the
+/// engine process. `handshake` is
 /// the endpoint the engine dials: a registered worker's is tcp-only
 /// ([`Handshake::registered`]); a servicer's own link may bind an `ipc://`
 /// socket ([`Handshake::TcpOrIpc`]).
@@ -320,6 +326,8 @@ impl ZmqEngineClient {
     /// keeps a single backend per process, chosen by the first request that
     /// needs one, so the caller resolves it once from the engine's
     /// `--structured-outputs-config` and every request carries the same one.
+    /// A connection nobody configures (the gateway's own worker link) runs
+    /// the engine's `auto`: xgrammar on every request.
     pub fn set_structured_outputs_backend(&self, config: StructuredOutputsBackendConfig) {
         let _ = self.meta.structured_outputs_backend.set(config);
     }
@@ -522,7 +530,12 @@ impl ZmqEngineClient {
         } else {
             TranslatedMedia::default()
         };
-        let structured_backend = self.meta.structured_outputs_backend.get().copied();
+        let structured_backend = self
+            .meta
+            .structured_outputs_backend
+            .get()
+            .copied()
+            .unwrap_or_default();
         // On the request's own `n`: every sub below carries `n = 1`.
         if let Some(sp) = req.sampling_params.as_ref() {
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
@@ -1116,7 +1129,9 @@ mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
 
     use engine_zmq_client::{
-        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound, MockEngine},
+        mock_engine::{
+            connect_to_frontend, default_ready_response, hello, EngineInbound, MockEngine,
+        },
         protocol::vllm::request::UtilityCall,
         EngineId,
     };
@@ -1125,7 +1140,7 @@ mod tests {
     use tonic::Code;
 
     use super::*;
-    use crate::{eos::EosTokenIds, sockets::ZMQ_CONNECT_TIMEOUT};
+    use crate::eos::EosTokenIds;
 
     /// A connected client over a throwaway ipc endpoint. The mock engine is
     /// dropped on return: these tests only inspect request-side EOS state.
@@ -1175,6 +1190,190 @@ mod tests {
         assert_eq!(client.effective_eos(), &resolved);
     }
 
+    /// The gateway's connect path across a retry: the first handshake greets
+    /// the engine and gives up its READY wait while the engine is still
+    /// loading (the startup bound is shorter than the engine's init); the
+    /// retry binds the same addresses again, and the engine's one READY and
+    /// one registration reach it. The retry takes the engine as its own: an
+    /// engine says HELLO once, so a wait for another would strand it.
+    #[tokio::test]
+    async fn a_retried_connect_takes_the_engine_the_first_handshake_greeted() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let handshake = format!("ipc://{}", dir.path().join("hs.sock").display());
+
+        let (gave_up, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::Vllm,
+                Handshake::TcpOrIpc(&handshake),
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(1),
+            ),
+            hello(&handshake, EngineId::from_engine_index(0)),
+        );
+        let Err(reason) = gave_up else {
+            panic!("the first connect must give up its READY wait");
+        };
+        assert!(reason.contains("waiting for READY"), "{reason}");
+        let engine = engine.expect("HELLO/INIT with the first connect");
+        // The dropped listeners' socket files go on their own tasks; the
+        // gateway retries a health probe later.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (client, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::Vllm,
+                Handshake::TcpOrIpc(&handshake),
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(10),
+            ),
+            async {
+                engine
+                    .redial(&handshake)
+                    .await?
+                    .ready(default_ready_response())
+                    .await
+            },
+        );
+        let client = client.expect("the retry connects the engine");
+        engine.expect("mock engine connected");
+        assert_eq!(client.dialect(), ZmqDialect::Vllm);
+    }
+
+    /// The gateway's own connection (nothing configures the backend, as
+    /// behind `--worker-urls ipc://...`) against an engine that keeps the
+    /// backend of its first structured request for its life: whichever
+    /// constraint comes first, every later one carries the backend the engine
+    /// settled on, and that backend is the one a structural tag compiles on,
+    /// so the kind of the first request never decides whether a forced tool
+    /// call compiles later; a schema that backend cannot enforce is refused
+    /// before the engine instead of being answered off the schema.
+    #[tokio::test]
+    async fn the_first_structured_request_never_strands_a_later_one() {
+        use engine_zmq_client::protocol::vllm::structured_outputs::{
+            StructuredOutputBackend, StructuredOutputConstraint,
+        };
+        use vllm::sampling_params::Constraint;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let handshake = format!("ipc://{}", dir.path().join("hs.sock").display());
+        let (client, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::Vllm,
+                Handshake::TcpOrIpc(&handshake),
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(10),
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let mut engine = engine.expect("mock engine");
+
+        // The engine's rule: the first structured request creates its one
+        // backend; a later request stamped for another would fail at grammar
+        // build (or, for a tag, compile on a backend that has no such format).
+        let mut engine_backend: Option<StructuredOutputBackend> = None;
+        // Held open: dropping a stream aborts its request on the same socket.
+        let mut streams = Vec::new();
+        for (id, constraint) in [
+            (
+                "json-answer-first",
+                Constraint::JsonSchema(
+                    r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.to_string(),
+                ),
+            ),
+            (
+                "forced-call",
+                Constraint::StructuralTag(
+                    r#"{"format":{"type":"triggered_tags","triggers":["<tool_call>"],"tags":[]}}"#
+                        .to_string(),
+                ),
+            ),
+            ("json-object", Constraint::JsonObject(true)),
+            ("regex", Constraint::Regex("[0-9]+".to_string())),
+            ("grammar", Constraint::Grammar("root ::= \"a\"".to_string())),
+            (
+                "choice",
+                Constraint::Choice(vllm::ChoiceConstraint {
+                    choices: vec!["yes".to_string(), "no".to_string()],
+                }),
+            ),
+            (
+                "schema-xgrammar-lacks",
+                Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
+            ),
+        ] {
+            let request = vllm::GenerateRequest {
+                request_id: id.to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![1, 2, 3],
+                    },
+                )),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(8),
+                    constraint: Some(constraint),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            let outcome = client.generate_vllm_streams(request).await;
+            if id == "schema-xgrammar-lacks" {
+                // Refused before the engine, as vLLM's frontend refuses it
+                // under `backend=xgrammar`: xgrammar would compile it with
+                // `multipleOf` dropped and answer off the schema.
+                let status = outcome.err().expect("refused");
+                assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+                continue;
+            }
+            streams.push(outcome.expect("generate"));
+            let EngineInbound::Add(engine_request) = engine.recv().await.expect("inbound") else {
+                panic!("{id}: expected an add request");
+            };
+            let structured = engine_request
+                .sampling_params
+                .and_then(|sp| sp.structured_outputs)
+                .expect("structured outputs");
+            let settled = *engine_backend.get_or_insert(structured.backend);
+            assert_eq!(
+                structured.backend, settled,
+                "{id}: stamped for a backend the engine does not run"
+            );
+            if id == "choice" {
+                // xgrammar compiles no choice: it goes as the grammar vLLM's
+                // frontend substitutes.
+                assert!(
+                    matches!(
+                        structured.constraint,
+                        StructuredOutputConstraint::Grammar(_)
+                    ),
+                    "{id}: {:?}",
+                    structured.constraint
+                );
+            }
+        }
+        // The backend the engine settled on is the one the triggered-tags
+        // format compiles on.
+        assert_eq!(engine_backend, Some(StructuredOutputBackend::Xgrammar));
+        drop(streams);
+    }
+
     /// The dialect is resolved before the handshake, so a runtime with no ZMQ
     /// adapter fails immediately instead of blocking for the connect timeout
     /// (this test would hang on the generous timeout otherwise).
@@ -1190,7 +1389,7 @@ mod tests {
             "m".to_string(),
             EosTokenIds::default(),
             RuntimeType::Trtllm,
-            ZMQ_CONNECT_TIMEOUT,
+            Duration::from_secs(600),
         )
         .await
         else {

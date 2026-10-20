@@ -9,16 +9,24 @@ use crate::error::{Error, Result};
 /// Structured-output backend selected for EngineCore grammar compilation.
 ///
 /// Python stores this in `StructuredOutputsParams._backend` after request
-/// validation and the engine uses it as is. A sender that knows the engine's
-/// configured backend pins it on every request; otherwise this client picks
-/// one per constraint: structural tags require xgrammar (the triggered-tags
-/// format is not understood by guidance's legacy structures/triggers parser);
-/// everything else lowers to guidance.
+/// validation and the engine uses it as is. The engine's structured-output
+/// manager builds one backend per process, from the first structured request
+/// it sees, and compiles every later request on that one whatever its own
+/// `_backend` says. A sender that knows the engine's configured backend pins
+/// it on every request; otherwise this client stamps the default, xgrammar,
+/// on every constraint: a structural tag in the triggered-tags format
+/// compiles on xgrammar alone (guidance's parser knows only the legacy
+/// structures/triggers shape), so an engine that may receive one must settle
+/// on xgrammar whichever constraint reaches it first. xgrammar compiles a
+/// JSON schema with features it lacks with those keywords dropped (an answer
+/// off the schema, not an error), so a sender that stamps it refuses such a
+/// schema before it reaches the engine, as vLLM's frontend does under
+/// `backend=xgrammar` ([`has_xgrammar_unsupported_json_features`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StructuredOutputBackend {
-    Xgrammar,
     #[default]
+    Xgrammar,
     Guidance,
     Outlines,
     LmFormatEnforcer,
@@ -62,7 +70,7 @@ pub struct StructuredOutputsParams {
     pub constraint: StructuredOutputConstraint,
     pub options: StructuredOutputOptions,
     /// Structured-output backend, mirroring Python's internal `_backend`: the
-    /// one the sender pinned, else the per-constraint default.
+    /// one the sender pinned, else the default ([`StructuredOutputBackend`]).
     pub backend: StructuredOutputBackend,
 }
 
@@ -93,12 +101,17 @@ impl StructuredOutputsParams {
         ))
     }
 
+    /// The constraint under the default backend. A choice stays a choice
+    /// here: the sender pins the engine's backend through
+    /// [`with_backend`](Self::with_backend) before it sends, which lowers a
+    /// choice to the grammar xgrammar compiles and keeps it for a backend
+    /// that serves choices itself (guidance); lowering here would hand that
+    /// backend a grammar it does not parse.
     fn from_constraint(constraint: StructuredOutputConstraint) -> Self {
-        let backend = default_backend(&constraint);
         Self {
             constraint,
             options: StructuredOutputOptions::default(),
-            backend,
+            backend: StructuredOutputBackend::default(),
         }
     }
 
@@ -114,47 +127,6 @@ impl StructuredOutputsParams {
         }
         self.backend = backend;
         self
-    }
-
-    /// [`with_backend`](Self::with_backend) with the backend vLLM's `auto`
-    /// resolves to for this constraint ([`auto_backend`]).
-    pub fn with_auto_backend(self) -> Self {
-        let backend = auto_backend(&self.constraint);
-        self.with_backend(backend)
-    }
-}
-
-/// The backend vLLM's frontend settles on under `--structured-outputs-config
-/// backend=auto` (`SamplingParams.update_from_tokenizer`, the `auto` branch):
-/// xgrammar, unless the constraint is a JSON schema with features xgrammar
-/// does not compile, which falls back to guidance, or to outlines when
-/// guidance cannot compile it either. These are the frontend's static checks;
-/// the xgrammar parse it also runs needs xgrammar itself, so a regex or
-/// grammar xgrammar rejects fails at the engine's grammar compile (that
-/// request only) instead of falling back.
-pub fn auto_backend(constraint: &StructuredOutputConstraint) -> StructuredOutputBackend {
-    let StructuredOutputConstraint::Json(schema) = constraint else {
-        return StructuredOutputBackend::Xgrammar;
-    };
-    // A schema string is parsed as the frontend parses it; one that is not
-    // JSON is left to xgrammar, which refuses it at compile.
-    let parsed: Value;
-    let schema = match schema {
-        Value::String(text) => match serde_json::from_str::<Value>(text) {
-            Ok(value) => {
-                parsed = value;
-                &parsed
-            }
-            Err(_) => return StructuredOutputBackend::Xgrammar,
-        },
-        other => other,
-    };
-    if !has_xgrammar_unsupported_json_features(schema) {
-        StructuredOutputBackend::Xgrammar
-    } else if has_guidance_unsupported_json_features(schema) {
-        StructuredOutputBackend::Outlines
-    } else {
-        StructuredOutputBackend::Guidance
     }
 }
 
@@ -187,7 +159,7 @@ pub fn choice_as_grammar(choices: &[String]) -> String {
 }
 
 /// Whether a nested schema value (an object, or an array of objects) fails
-/// `check`, the recursion both feature checks share.
+/// `check`, the recursion of [`has_xgrammar_unsupported_json_features`].
 fn any_nested(obj: &serde_json::Map<String, Value>, check: fn(&Value) -> bool) -> bool {
     obj.values().any(|value| match value {
         Value::Object(_) => check(value),
@@ -197,8 +169,13 @@ fn any_nested(obj: &serde_json::Map<String, Value>, check: fn(&Value) -> bool) -
 }
 
 /// vLLM's `has_xgrammar_unsupported_json_features`
-/// (`v1/structured_output/backend_xgrammar.py`), keyword for keyword.
-fn has_xgrammar_unsupported_json_features(schema: &Value) -> bool {
+/// (`v1/structured_output/backend_xgrammar.py`), keyword for keyword: the
+/// schema features xgrammar's converter drops instead of refusing. vLLM's
+/// frontend refuses such a schema with a 400 under `backend=xgrammar`
+/// (`validate_xgrammar_grammar`); a sender stamping xgrammar does the same. A
+/// schema given as a string is parsed as the frontend parses it; one that is
+/// not JSON is left to xgrammar, which refuses it at compile.
+pub fn has_xgrammar_unsupported_json_features(schema: &Value) -> bool {
     const STRING_SUPPORTED_FORMATS: [&str; 14] = [
         "email",
         "date",
@@ -288,31 +265,18 @@ fn has_xgrammar_unsupported_json_features(schema: &Value) -> bool {
         }
         any_nested(obj, check)
     }
+    let parsed: Value;
+    let schema = match schema {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(value) => {
+                parsed = value;
+                &parsed
+            }
+            Err(_) => return false,
+        },
+        other => other,
+    };
     check(schema)
-}
-
-/// vLLM's `has_guidance_unsupported_json_features`
-/// (`v1/structured_output/backend_guidance.py`): llguidance has no
-/// `patternProperties`.
-fn has_guidance_unsupported_json_features(schema: &Value) -> bool {
-    fn check(value: &Value) -> bool {
-        let Value::Object(obj) = value else {
-            return false;
-        };
-        obj.contains_key("patternProperties") || any_nested(obj, check)
-    }
-    check(schema)
-}
-
-/// The backend a constraint gets when the sender pinned none. Structural tags
-/// use the triggered-tags format that only xgrammar compiles; guidance's
-/// parser expects the legacy structures/triggers shape and fails the request
-/// at grammar build.
-fn default_backend(constraint: &StructuredOutputConstraint) -> StructuredOutputBackend {
-    match constraint {
-        StructuredOutputConstraint::StructuralTag(_) => StructuredOutputBackend::Xgrammar,
-        _ => StructuredOutputBackend::default(),
-    }
 }
 
 /// `true` when a boolean is `false`; used to drop default-`false` flags from the
@@ -344,7 +308,7 @@ struct WireStructuredOutputsParams {
     structural_tag: Option<String>,
     /// The backend the sender pinned (vLLM's frontend sets it after
     /// validation; the engine reads it as is). Absent falls back to the
-    /// per-constraint default.
+    /// default.
     #[serde(default, rename = "_backend")]
     backend: Option<StructuredOutputBackend>,
 }
@@ -422,9 +386,7 @@ impl TryFrom<WireStructuredOutputsParams> for StructuredOutputsParams {
                 disable_additional_properties: raw.disable_additional_properties,
                 whitespace_pattern: raw.whitespace_pattern,
             },
-            backend: raw
-                .backend
-                .unwrap_or_else(|| default_backend(&constraint_ref)),
+            backend: raw.backend.unwrap_or_default(),
             constraint: constraint_ref,
         })
     }
@@ -490,87 +452,18 @@ mod tests {
         // `_backend` as is, so decoding keeps it and re-encoding repeats it.
         let raw = serde_json::json!({
             "json_object": true,
-            "_backend": "xgrammar",
+            "_backend": "guidance",
         });
         let params: StructuredOutputsParams = serde_json::from_value(raw).unwrap();
-        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
         assert_eq!(params.constraint, StructuredOutputConstraint::JsonObject);
         let value = serde_json::to_value(&params).unwrap();
-        assert_eq!(value["_backend"], "xgrammar");
+        assert_eq!(value["_backend"], "guidance");
 
-        // Unpinned, the per-constraint default applies.
+        // Unpinned, the default applies.
         let raw = serde_json::json!({ "json_object": true });
         let params: StructuredOutputsParams = serde_json::from_value(raw).unwrap();
-        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
-    }
-
-    /// vLLM's `auto`: xgrammar unless the JSON schema uses a feature it
-    /// does not compile (then guidance, or outlines when guidance has no
-    /// `patternProperties` either); non-JSON constraints go to xgrammar.
-    #[test]
-    fn auto_backend_follows_vllms_static_checks() {
-        let json = |schema: Value| auto_backend(&StructuredOutputConstraint::Json(schema));
-        assert_eq!(
-            json(serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}})),
-            StructuredOutputBackend::Xgrammar
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "integer", "multipleOf": 5})),
-            StructuredOutputBackend::Guidance
-        );
-        // Nested, and under a list-valued type.
-        assert_eq!(
-            json(
-                serde_json::json!({"type": "object", "properties": {"tags": {
-                "type": ["array", "null"], "uniqueItems": true}}})
-            ),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "string", "format": "email"})),
-            StructuredOutputBackend::Xgrammar
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "string", "format": "iri"})),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "string", "pattern": "^a", "maxLength": 3})),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(
-                serde_json::json!({"type": "object", "propertyNames": {"pattern": "^x"},
-                "properties": {"x": {}}})
-            ),
-            StructuredOutputBackend::Guidance
-        );
-        // Two patternProperties fail xgrammar, and guidance has none at all.
-        assert_eq!(
-            json(serde_json::json!({"type": "object",
-                "patternProperties": {"^a": {}, "^b": {}}})),
-            StructuredOutputBackend::Outlines
-        );
-        // A schema string is parsed like the frontend parses it.
-        assert_eq!(
-            json(Value::String(
-                r#"{"type":"number","multipleOf":0.5}"#.into()
-            )),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(Value::String("not json".into())),
-            StructuredOutputBackend::Xgrammar
-        );
-        for constraint in [
-            StructuredOutputConstraint::Regex("[a-z]+".into()),
-            StructuredOutputConstraint::Grammar("start: \"a\"".into()),
-            StructuredOutputConstraint::Choice(vec!["a".into()]),
-            StructuredOutputConstraint::JsonObject,
-            StructuredOutputConstraint::StructuralTag("{}".into()),
-        ] {
-            assert_eq!(auto_backend(&constraint), StructuredOutputBackend::Xgrammar);
-        }
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
     }
 
     /// Pinning xgrammar rewrites a choice into the grammar vLLM's frontend
@@ -600,18 +493,13 @@ mod tests {
             .with_backend(StructuredOutputBackend::Guidance);
         assert_eq!(
             params.constraint,
-            StructuredOutputConstraint::Choice(choices.clone())
+            StructuredOutputConstraint::Choice(choices)
         );
         assert_eq!(params.backend, StructuredOutputBackend::Guidance);
 
-        // `auto` resolves to xgrammar for a choice, so it lowers too.
-        let params = StructuredOutputsParams::choice(choices).with_auto_backend();
-        assert!(matches!(
-            params.constraint,
-            StructuredOutputConstraint::Grammar(_)
-        ));
         // A Lark grammar passes to xgrammar unchanged (it parses Lark itself).
-        let params = StructuredOutputsParams::grammar("start: \"a\" | \"b\"").with_auto_backend();
+        let params = StructuredOutputsParams::grammar("start: \"a\" | \"b\"")
+            .with_backend(StructuredOutputBackend::Xgrammar);
         assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
         assert_eq!(
             params.constraint,
@@ -619,16 +507,73 @@ mod tests {
         );
     }
 
+    /// The engine keeps the backend of its first structured request for its
+    /// life, and the triggered-tags format compiles on xgrammar alone: every
+    /// constraint is stamped xgrammar unless the sender pins another, so the
+    /// kind that reaches a fresh engine first never decides whether a later
+    /// structural tag compiles.
     #[test]
-    fn structural_tag_selects_xgrammar_backend() {
-        // The triggered-tags format only compiles under xgrammar; guidance's
-        // legacy parser fails the request at grammar build.
-        let params = StructuredOutputsParams::structural_tag(r#"{"format":{}}"#);
-        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
-
-        let value = serde_json::to_value(params).unwrap();
-        assert_eq!(value["_backend"], "xgrammar");
+    fn every_constraint_defaults_to_xgrammar() {
+        for params in [
+            StructuredOutputsParams::json(serde_json::json!({"type": "object"})),
+            StructuredOutputsParams::json(serde_json::json!({"type": "integer", "multipleOf": 3})),
+            StructuredOutputsParams::json_object(),
+            StructuredOutputsParams::regex("[a-z]+"),
+            StructuredOutputsParams::grammar("root ::= \"a\""),
+            StructuredOutputsParams::choice(vec!["a".into()]),
+            StructuredOutputsParams::structural_tag(r#"{"format":{}}"#),
+        ] {
+            assert_eq!(
+                params.backend,
+                StructuredOutputBackend::Xgrammar,
+                "{params:?}"
+            );
+            let value = serde_json::to_value(&params).unwrap();
+            assert_eq!(value["_backend"], "xgrammar", "{params:?}");
+        }
+        let value =
+            serde_json::to_value(StructuredOutputsParams::structural_tag(r#"{"format":{}}"#))
+                .unwrap();
         assert_eq!(value["structural_tag"], r#"{"format":{}}"#);
+    }
+
+    /// vLLM's static xgrammar feature check, the one a sender stamping
+    /// xgrammar refuses a schema by: the keywords xgrammar would drop, nested
+    /// and under a list-valued type as well; a plain object passes, and a
+    /// schema string is parsed as the frontend parses it.
+    #[test]
+    fn xgrammar_unsupported_features_are_detected() {
+        let lacks = |schema: Value| has_xgrammar_unsupported_json_features(&schema);
+        assert!(!lacks(
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "integer", "multipleOf": 5})
+        ));
+        // Nested, and under a list-valued type.
+        assert!(lacks(
+            serde_json::json!({"type": "object", "properties": {"tags": {
+            "type": ["array", "null"], "uniqueItems": true}}})
+        ));
+        assert!(!lacks(
+            serde_json::json!({"type": "string", "format": "email"})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "string", "format": "iri"})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "string", "pattern": "^a", "maxLength": 3})
+        ));
+        assert!(lacks(serde_json::json!({"type": "object",
+            "propertyNames": {"pattern": "^x"}, "properties": {"x": {}}})));
+        assert!(lacks(serde_json::json!({"type": "object",
+            "patternProperties": {"^a": {}, "^b": {}}})));
+        // A schema string is parsed like the frontend parses it; one that is
+        // not JSON is left to xgrammar.
+        assert!(lacks(Value::String(
+            r#"{"type":"number","multipleOf":0.5}"#.into()
+        )));
+        assert!(!lacks(Value::String("not json".into())));
     }
 
     #[test]
