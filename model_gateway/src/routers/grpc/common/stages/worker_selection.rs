@@ -1973,6 +1973,7 @@ impl WorkerSelectionStage {
             cache_namespace,
             hash_ring: hash_ring.clone(),
             role: WorkerRole::Prefill,
+            overload_lifted: false,
         };
         let prefill_idx = self
             .policy_registry
@@ -2114,6 +2115,7 @@ fn assign_encode_workers(
                 cache_namespace: None,
                 hash_ring: hash_ring.clone(),
                 role: WorkerRole::Single,
+                overload_lifted: false,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;
             let worker = encode_workers[worker_idx].clone();
