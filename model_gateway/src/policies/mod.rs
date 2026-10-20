@@ -373,14 +373,14 @@ pub struct SelectWorkerInfo<'a> {
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
     pub role: WorkerRole,
-    /// The absolute overload veto does not apply to this selection: every
-    /// worker of its pool is over the thresholds, so the veto cannot steer
-    /// it, or the pool's policy balances load against cache affinity itself
-    /// ([`LoadBalancingPolicy::balances_load_against_affinity`]). The policy
-    /// takes a worker over them as it takes one under them (health, the
-    /// circuit breaker and the liveness veto still apply). Set by
-    /// disaggregated pair placement (see `placement::select_pair`); a
-    /// single-worker placement keeps the least-loaded steering default.
+    /// The absolute overload veto does not apply to this selection: the
+    /// pool's policy balances load against cache affinity itself
+    /// ([`LoadBalancingPolicy::balances_load_against_affinity`]), so it
+    /// takes a worker over the thresholds as it takes one under them, even
+    /// when every worker is over them (health, the circuit breaker and the
+    /// liveness veto still apply). Set by disaggregated pair placement for
+    /// such a prefill pool (see `placement::select_pair`); every other pool
+    /// keeps the veto and the least-loaded steering default.
     pub overload_lifted: bool,
 }
 

@@ -767,8 +767,9 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_worker_overload_fallback_total",
-        "Requests routed to the least-loaded worker because every worker for the model is \
-         overloaded and shedding is off, by stage"
+        "Requests placed although every worker they could use is overloaded and shedding is \
+         off, by stage: routed to the least-loaded worker, or, for a cache-aware prefill pool \
+         of a prefill/decode pair, placed by that policy"
     );
     describe_counter!(
         "smg_worker_liveness_fallback_total",
@@ -2109,8 +2110,10 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record a request steered to the least-loaded worker because every
-    /// worker for the model is overloaded and shedding is off.
+    /// Record a request placed although every worker it could use is
+    /// overloaded and shedding is off: steered to the least-loaded worker,
+    /// or, for a cache-aware prefill pool of a prefill/decode pair, placed by
+    /// that policy (which counts the pick as a selection too).
     pub fn record_worker_overload_fallback(stage: &'static str) {
         counter!(
             "smg_worker_overload_fallback_total",

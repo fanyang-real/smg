@@ -506,13 +506,12 @@ struct RoutingArgs {
     /// lines still parse). A worker whose load report is at or above
     /// --worker-overload-waiting-requests or --worker-overload-token-usage is
     /// left out of routing while another worker is under them; when every
-    /// worker is over them the request goes to the least-loaded one (in gRPC
-    /// and HTTP prefill/decode pair placement such a pool is placed by its
-    /// own policy, as if none were over them, and a cache-aware prefill pool
-    /// is not steered by them at all, its spill gate balancing it), unless
-    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load report, never per
-    /// request. Per-worker `overload` blocks on a WorkerSpec override the
-    /// gateway values per signal
+    /// worker is over them the request goes to the least-loaded one, unless
+    /// --worker-overload-shed asks for a 503 instead. A cache-aware prefill
+    /// pool of gRPC and HTTP prefill/decode pair placement is not steered by
+    /// them at all: its spill gate balances it. Evaluated once per load
+    /// report, never per request. Per-worker `overload` blocks on a
+    /// WorkerSpec override the gateway values per signal
     #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 
@@ -540,9 +539,10 @@ struct RoutingArgs {
 
     /// Refuse a request with a 503 (worker_overload_protection_shed,
     /// Retry-After the load poll interval) when every worker it could use is
-    /// overloaded, instead of routing it to the least-loaded one; also sheds a
-    /// worker that crossed a threshold between selection and dispatch. Off by
-    /// default: steering never turns a load signal into an outage
+    /// overloaded, instead of routing it to the least-loaded one (or, for a
+    /// cache-aware prefill pool, by its policy); also sheds a worker that
+    /// crossed a threshold between selection and dispatch. Off by default:
+    /// steering never turns a load signal into an outage
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     worker_overload_shed: bool,
 
