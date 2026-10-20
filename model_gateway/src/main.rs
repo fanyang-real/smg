@@ -508,8 +508,9 @@ struct RoutingArgs {
     /// left out of routing while another worker is under them; when every
     /// worker is over them the request goes to the least-loaded one (in gRPC
     /// and HTTP prefill/decode pair placement such a pool is placed by its
-    /// own policy, as if none were over them), unless --worker-overload-shed
-    /// asks for a 503 instead. Evaluated once per load report, never per
+    /// own policy, as if none were over them, and a cache-aware prefill pool
+    /// is not steered by them at all, its spill gate balancing it), unless
+    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load report, never per
     /// request. Per-worker `overload` blocks on a WorkerSpec override the
     /// gateway values per signal
     #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
