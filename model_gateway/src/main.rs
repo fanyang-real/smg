@@ -844,11 +844,14 @@ struct WorkerArgs {
     /// non-streaming generations give no signal and never form one. The
     /// same bound, read per request, is how long a prefill side of a
     /// disaggregated dispatch may produce nothing, with its worker answering
-    /// no other side either (for that long, or for the time its whole
-    /// prefill backlog takes when longer; an idle spell is not counted),
-    /// before its request fails over to another prefill worker (or fails,
-    /// when there is none); a side queued on a worker that keeps answering
-    /// waits on. On the parallel dispatch shape a prefill side's first
+    /// no other side either, before its request fails over to another
+    /// prefill worker (or fails, when there is none); a side queued on a
+    /// worker that keeps answering waits on, and so does one whose worker
+    /// has not answered its current run of prompts yet (a burst after an
+    /// idle spell, or since the gateway started), until that run has gone
+    /// unanswered for the time the worker's backlog takes at its prefill
+    /// rate (two minutes at most), keeping its decode admission room
+    /// meanwhile. On the parallel dispatch shape a prefill side's first
     /// response also waits for the decode side (its bootstrap, and KV
     /// pre-allocation under decode pressure), so the threshold must cover
     /// that wait for a prefill worker with nothing else to answer
